@@ -1,0 +1,15 @@
+syntax = "proto3";
+package game.common;
+
+message Vec2 {
+  float x = 1;
+  float y = 2;
+}
+
+message PlayerState {
+  uint32 player_id = 1;
+  Vec2 position = 2;
+  Vec2 velocity = 3;
+  uint32 score = 4;
+  bool alive = 5;
+}

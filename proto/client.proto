@@ -1,0 +1,26 @@
+syntax = "proto3";
+package game.client;
+
+message ClientMessage {
+  oneof payload {
+    JoinRoom join_room = 1;
+    PlayerInput player_input = 2;
+    LeaveRoom leave_room = 3;
+    Ready ready = 4;
+  }
+}
+
+message JoinRoom {
+  string room_code = 1;
+  string player_name = 2;
+}
+
+message PlayerInput {
+  uint32 tick = 1;
+  float direction = 2;
+  bool dash = 3;
+}
+
+message LeaveRoom {}
+
+message Ready {}
