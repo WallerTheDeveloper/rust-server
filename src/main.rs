@@ -10,8 +10,8 @@ async fn main() -> std::io::Result<()> {
     tracing::info!("Game server started");
 
     loop {
-        let (data, addr) = server.recv().await?;
-        tracing::debug!("Received {} bytes from {}", data.len(), addr);
+        let (data, addr) = server.receive().await?;
+        tracing::info!("Received {} bytes from {}", data.len(), addr);
 
         match ClientMessage::decode(&data[..]) {
             Ok(msg) => {

@@ -13,7 +13,7 @@ impl UdpServer {
         Ok(Self { socket })
     }
 
-    pub async fn recv(&self) -> Result<(Vec<u8>, SocketAddr)> {
+    pub async fn receive(&self) -> Result<(Vec<u8>, SocketAddr)> {
         let mut buf = vec![0u8; 1024];
         let (len, addr) = self.socket.recv_from(&mut buf).await?;
         buf.truncate(len);
