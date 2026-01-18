@@ -43,6 +43,8 @@ impl SessionManager {
         }
 
         let player_id = self.next_player_id;
+        
+        // TODO: Generate unique player ID
         self.next_player_id += 1;
 
         let session = Session {
@@ -71,6 +73,15 @@ impl SessionManager {
         self.sessions_by_addr.get(addr)
     }
 
+    pub fn get_by_addr_mut(&mut self, addr: &SocketAddr) -> Option<&mut Session> {
+        self.sessions_by_addr.get_mut(addr)
+    }
+
+    pub fn get_by_player_id(&self, player_id: PlayerId) -> Option<&Session> {
+        self.addr_by_player_id
+            .get(&player_id)
+            .and_then(|addr| self.sessions_by_addr.get(addr))
+    }
 
     pub fn remove(&mut self, addr: &SocketAddr) -> Option<Session> {
         if let Some(session) = self.sessions_by_addr.remove(addr) {

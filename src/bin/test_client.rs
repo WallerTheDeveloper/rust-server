@@ -6,9 +6,11 @@ use rust_server::protocol::client::{
     ClientMessage, JoinRoom, PlayerInput, Ready,
     client_message::Payload,
 };
+use rust_server::protocol::server::ServerMessage;
 
 fn main() -> std::io::Result<()> {
     let socket = UdpSocket::bind("127.0.0.1:0")?;
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     let server_addr = "127.0.0.1:9000";
 
     // 1. Send JoinRoom
@@ -20,6 +22,17 @@ fn main() -> std::io::Result<()> {
     };
     socket.send_to(&join_msg.encode_to_vec(), server_addr)?;
     println!("Sent: JoinRoom");
+
+    // Wait for response
+    let mut buf = [0u8; 1024];
+    match socket.recv_from(&mut buf) {
+        Ok((len, _)) => {
+            if let Ok(response) = ServerMessage::decode(&buf[..len]) {
+                println!("Received: {:?}", response);
+            }
+        }
+        Err(e) => println!("No response: {}", e),
+    }
 
     thread::sleep(Duration::from_millis(100));
 
@@ -33,7 +46,7 @@ fn main() -> std::io::Result<()> {
     thread::sleep(Duration::from_millis(100));
 
     // 3. Send some PlayerInput
-    for i in 0..5 {
+    for i in 0..3 {
         let input_msg = ClientMessage {
             payload: Some(Payload::PlayerInput(PlayerInput {
                 tick: i,
@@ -46,6 +59,6 @@ fn main() -> std::io::Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
 
-    println!("Done sending messages");
+    println!("Done!");
     Ok(())
 }
