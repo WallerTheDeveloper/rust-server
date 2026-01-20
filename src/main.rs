@@ -1,5 +1,8 @@
 use rust_server::network::udp::UdpServer;
-use rust_server::protocol::client::{ClientMessage, client_message::Payload, Ping};
+use rust_server::protocol::client::{
+    ClientMessage, Ping,
+    client_message::Payload,
+};
 use rust_server::protocol::server::{
     ServerMessage, server_message,
     RoomJoined, RoomUpdate, PlayerInfo, PlayerLeft, GameStarting, GameMessage as ServerGameMessage, Error, Pong
@@ -128,16 +131,13 @@ async fn handle_ping(server: &UdpServer,
         tracing::warn!("Ping from unknown address {}", addr);
     }
 
-    let current_server_time = std::time::SystemTime::now().
-            duration_since(std::time::UNIX_EPOCH).
-            unwrap().
-            as_millis() as u64;
+    let current_server_timestamp = current_timestamp_ms();
 
     let pong_message = ServerMessage {
         payload: Some(server_message::Payload::Pong(Pong {
             timestamp: ping.timestamp,
             sequence: ping.sequence,
-            server_time: current_server_time,
+            server_time: current_server_timestamp,
         }))
     };
 
@@ -380,4 +380,11 @@ async fn handle_game_message(
     }
 
     tracing::trace!("Relayed message from player {} to room {}", player_id, room_code);
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
