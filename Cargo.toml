@@ -11,3 +11,6 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [build-dependencies]
 prost-build = "0.14.3"
+
+[profile.dev]
+debug = true

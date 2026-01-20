@@ -8,11 +8,10 @@ message ServerMessage {
     RoomJoined room_joined = 1;
     RoomUpdate room_update = 2;
     GameStarting game_starting = 3;
-    GameState game_state = 4;
-    RoundEnded round_ended = 5;
-    GameEnded game_ended = 6;
-    PlayerLeft player_left = 7;
-    Error error = 8;
+    GameMessage game_message = 4;
+    GameEnded game_ended = 5;
+    PlayerLeft player_left = 6;
+    Error error = 7;
   }
 }
 
@@ -34,30 +33,15 @@ message RoomUpdate {
 
 message GameStarting {
   uint32 countdown_seconds = 1;
-  game.common.Vec2 spotlight = 2;
 }
 
-message GameState {
-  uint32 tick = 1;
-  repeated game.common.PlayerState players = 2;
-  game.common.Vec2 spotlight = 3;
-  float round_time_remaining = 4;
-}
-
-message RoundEnded {
-  uint32 round_number = 1;
-  repeated PlayerScore scores = 2;
-  uint32 next_round_in = 3;
-}
-
-message PlayerScore {
-  uint32 player_id = 1;
-  uint32 score = 2;
+message GameMessage {
+  uint32 from_player_id = 1;
+  bytes payload = 2;
 }
 
 message GameEnded {
-  repeated PlayerScore final_scores = 1;
-  uint32 winner_id = 2;
+  uint32 winner_id = 1;
 }
 
 message PlayerLeft {

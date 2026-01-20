@@ -13,7 +13,7 @@ impl UdpServer {
         Ok(Self { socket })
     }
 
-    pub async fn receive(&self) -> Result<(Vec<u8>, SocketAddr)> {
+    pub async fn recv(&self) -> Result<(Vec<u8>, SocketAddr)> {
         let mut buf = vec![0u8; 1024];
         let (len, addr) = self.socket.recv_from(&mut buf).await?;
         buf.truncate(len);
@@ -23,5 +23,13 @@ impl UdpServer {
     pub async fn send(&self, data: &[u8], addr: SocketAddr) -> Result<()> {
         self.socket.send_to(data, addr).await?;
         Ok(())
+    }
+
+    pub async fn send_to_many(&self, data: &[u8], addrs: &[SocketAddr]) {
+        for addr in addrs {
+            if let Err(e) = self.socket.send_to(data, addr).await {
+                tracing::warn!("Failed to send to {}: {}", addr, e);
+            }
+        }
     }
 }

@@ -4,9 +4,9 @@ package game.client;
 message ClientMessage {
   oneof payload {
     JoinRoom join_room = 1;
-    PlayerInput player_input = 2;
-    LeaveRoom leave_room = 3;
-    Ready ready = 4;
+    LeaveRoom leave_room = 2;
+    Ready ready = 3;
+    GameMessage game_message = 4;
   }
 }
 
@@ -15,12 +15,10 @@ message JoinRoom {
   string player_name = 2;
 }
 
-message PlayerInput {
-  uint32 tick = 1;
-  float direction = 2;
-  bool dash = 3;
-}
-
 message LeaveRoom {}
 
 message Ready {}
+
+message GameMessage {
+  bytes payload = 1;
+}
