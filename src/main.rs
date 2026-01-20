@@ -100,6 +100,10 @@ async fn main() -> std::io::Result<()> {
                 handle_game_message(&server, &mut sessions, &rooms, addr, game_msg.payload).await;
             }
 
+            Some(Payload::Ping(_)) => {
+                tracing::info!("Ping received");
+            }
+
             None => {
                 tracing::warn!("Empty message from {}", addr);
             }

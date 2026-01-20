@@ -12,6 +12,7 @@ message ServerMessage {
     GameEnded game_ended = 5;
     PlayerLeft player_left = 6;
     Error error = 7;
+    Pong pong = 8;
   }
 }
 
@@ -50,4 +51,10 @@ message PlayerLeft {
 
 message Error {
   string message = 1;
+}
+
+message Pong {
+  uint64 timestamp = 1;
+  uint32 sequence = 2;
+  uint64 server_time = 3;
 }
