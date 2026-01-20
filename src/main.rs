@@ -1,8 +1,8 @@
 use rust_server::network::udp::UdpServer;
-use rust_server::protocol::client::{ClientMessage, client_message::Payload};
+use rust_server::protocol::client::{ClientMessage, client_message::Payload, Ping};
 use rust_server::protocol::server::{
     ServerMessage, server_message,
-    RoomJoined, RoomUpdate, PlayerInfo, PlayerLeft, GameStarting, GameMessage as ServerGameMessage, Error
+    RoomJoined, RoomUpdate, PlayerInfo, PlayerLeft, GameStarting, GameMessage as ServerGameMessage, Error, Pong
 };
 use rust_server::session::SessionManager;
 use rust_server::room::{RoomManager, RoomState};
@@ -100,8 +100,8 @@ async fn main() -> std::io::Result<()> {
                 handle_game_message(&server, &mut sessions, &rooms, addr, game_msg.payload).await;
             }
 
-            Some(Payload::Ping(_)) => {
-                tracing::info!("Ping received");
+            Some(Payload::Ping(ping)) => {
+                handle_ping(&server, &mut sessions, addr, ping).await;
             }
 
             None => {
@@ -109,6 +109,44 @@ async fn main() -> std::io::Result<()> {
             }
         }
     }
+}
+
+async fn handle_ping(server: &UdpServer,
+                     sessions: &mut SessionManager,
+                     addr: std::net::SocketAddr,
+                     ping: Ping) {
+    sessions.ping(&addr);
+
+    if let Some(session) = sessions.get_by_addr(&addr) {
+        tracing::trace!(
+            "Ping from player {} (seq={}, count={}",
+            session.player_id,
+            ping.sequence,
+            session.ping_count
+        );
+    } else {
+        tracing::warn!("Ping from unknown address {}", addr);
+    }
+
+    let current_server_time = std::time::SystemTime::now().
+            duration_since(std::time::UNIX_EPOCH).
+            unwrap().
+            as_millis() as u64;
+
+    let pong_message = ServerMessage {
+        payload: Some(server_message::Payload::Pong(Pong {
+            timestamp: ping.timestamp,
+            sequence: ping.sequence,
+            server_time: current_server_time,
+        }))
+    };
+
+    match server.send(&pong_message.encode_to_vec(), addr).await {
+        Ok(msg) => msg,
+        Err(e) => {
+            tracing::warn!("Failed to send pong: {}", e);
+        }
+    };
 }
 
 async fn handle_join_room(

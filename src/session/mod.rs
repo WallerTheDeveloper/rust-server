@@ -7,10 +7,13 @@ pub type PlayerId = u32;
 #[derive(Debug, Clone)]
 pub struct Session {
     pub player_id: PlayerId,
-    pub addr: SocketAddr,
     pub player_name: String,
-    pub last_seen: Instant,
+    pub addr: SocketAddr,
     pub room_code: Option<String>,
+    pub last_seen: Instant,
+    pub last_ping: Option<Instant>,
+    pub latency_ms: Option<u32>,
+    pub ping_count: u32,
 }
 
 /// Manages all connected player sessions
@@ -49,10 +52,13 @@ impl SessionManager {
 
         let session = Session {
             player_id,
-            addr,
             player_name,
-            last_seen: Instant::now(),
+            addr,
             room_code: None,
+            last_seen: Instant::now(),
+            last_ping: None,
+            latency_ms: None,
+            ping_count: 0,
         };
 
         self.sessions_by_addr.insert(addr, session);
@@ -61,6 +67,13 @@ impl SessionManager {
         tracing::info!("New player registered: id={}, addr={}", player_id, addr);
 
         self.sessions_by_addr.get(&addr).unwrap()
+    }
+    pub fn ping(&mut self, addr: &SocketAddr) {
+        if let Some(session) = self.sessions_by_addr.get_mut(addr) {
+            session.last_ping = Some(Instant::now());
+            session.last_seen = Instant::now();
+            session.ping_count += 1;
+        }
     }
 
     pub fn update_last_seen(&mut self, addr: &SocketAddr) {
