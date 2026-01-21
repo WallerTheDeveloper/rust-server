@@ -131,33 +131,33 @@ impl SessionManager {
         }
     }
 
-    pub fn cleanup_timed_out(&mut self) -> Vec<Session> {
+    pub fn mark_timed_out_as_disconnected(&mut self) -> Vec<PlayerId> {
         let now = Instant::now();
         let timeout = self.timeout_duration;
 
         let timed_out_addrs: Vec<SocketAddr> = self
             .sessions_by_addr
             .iter()
-            .filter(|(_, session)| now.duration_since(session.last_seen) > timeout)
+            .filter(|(_, session)| {
+                session.connection_state == ConnectionState::Connected &&
+                    now.duration_since(session.last_seen) > timeout
+            })
             .map(|(addr, _)| *addr)
             .collect();
+        
 
-        let mut removed = Vec::new();
+        let mut disconnected_players = Vec::new();
         for addr in timed_out_addrs {
-            if let Some(session) = self.remove(&addr) {
-                tracing::info!(
-                    "Player timed out: id={}, name={}",
-                    session.player_id,
-                    session.player_name
-                );
-                removed.push(session);
+            if let Some(session) = self.mark_disconnected(&addr) {
+                tracing::info!("Player with address {addr} got disconnected");
+                disconnected_players.push(session);
             }
         }
 
-        removed
+        disconnected_players
     }
 
-    pub fn mark_player_disconnected(&mut self, addr: &SocketAddr) -> Option<PlayerId> {
+    pub fn mark_disconnected(&mut self, addr: &SocketAddr) -> Option<PlayerId> {
         if let Some(session) = self.sessions_by_addr.get_mut(addr) {
             session.connection_state = ConnectionState::Disconnected;
             session.disconnected_at = Some(Instant::now());

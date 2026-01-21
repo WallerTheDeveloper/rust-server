@@ -1,17 +1,15 @@
-use rust_server::network::udp::UdpServer;
-use rust_server::protocol::client::{
-    ClientMessage, Ping,
-    client_message::Payload,
-};
-use rust_server::protocol::server::{
-    ServerMessage, server_message,
-    RoomJoined, RoomUpdate, PlayerInfo, PlayerLeft, GameStarting, GameMessage as ServerGameMessage, Error, Pong
-};
-use rust_server::session::SessionManager;
-use rust_server::room::{RoomManager, RoomState};
 use prost::Message;
+use rust_server::network::udp::UdpServer;
+use rust_server::protocol::client::{ClientMessage, Ping, Reconnect, client_message::Payload};
+use rust_server::protocol::server::{
+    Error, GameMessage as ServerGameMessage, GameStarting, PlayerDisconnected, PlayerInfo,
+    PlayerLeft, PlayerReconnected, Pong, RoomJoined, RoomUpdate, ServerMessage, server_message,
+};
+use rust_server::room::{RoomManager, RoomState};
+use rust_server::session::SessionManager;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -39,10 +37,45 @@ async fn main() -> std::io::Result<()> {
             let mut sessions = sessions_cleanup.lock().await;
             let mut rooms = rooms_cleanup.lock().await;
 
-            let timed_out = sessions.cleanup_timed_out();
-            for session in timed_out {
-                if let Some(room_code) = &session.room_code {
+            let disconnected_players = sessions.mark_timed_out_as_disconnected();
+            let grace_period_seconds = sessions.grace_period_seconds();
+
+            for player_id in disconnected_players {
+                if let Some(session) = sessions.get_by_player_id(player_id) {
+                    if let Some(room_code) = &session.room_code.clone() {
+                        let player_ids = rooms.get_room_player_ids(room_code);
+
+                        let msg = ServerMessage {
+                            payload: Some(server_message::Payload::PlayerDisconnected(
+                                PlayerDisconnected {
+                                    player_id,
+                                    grace_period_seconds,
+                                },
+                            )),
+                        };
+
+                        let bytes = msg.encode_to_vec();
+
+                        for pid in player_ids {
+                            if pid != player_id {
+                                if let Some(other) = sessions.get_by_player_id(pid) {
+                                    let _ = server_cleanup.send(&bytes, other.addr).await;
+                                }
+                            }
+                        }
+                        tracing::info!(
+                            "Player {player_id} disconnected from room {room_code} (grace period: {grace_period_seconds}s)"
+                        );
+                    }
                     // Notify others in room
+                    rooms.leave_room(session.player_id);
+                }
+            }
+
+            let expired_sessions = sessions.cleanup_expired_disconnected();
+
+            for session in expired_sessions {
+                if let Some(room_code) = &session.room_code {
                     let player_ids = rooms.get_room_player_ids(room_code);
                     rooms.leave_room(session.player_id);
 
@@ -51,6 +84,7 @@ async fn main() -> std::io::Result<()> {
                             player_id: session.player_id,
                         })),
                     };
+
                     let bytes = msg.encode_to_vec();
 
                     for pid in player_ids {
@@ -60,6 +94,12 @@ async fn main() -> std::io::Result<()> {
                             }
                         }
                     }
+
+                    tracing::info!(
+                        "Player {} permanently removed from room {}",
+                        session.player_id,
+                        room_code
+                    );
                 }
             }
         }
@@ -107,8 +147,8 @@ async fn main() -> std::io::Result<()> {
                 handle_ping(&server, &mut sessions, addr, ping).await;
             }
 
-            Some(Payload::Reconnect(_)) => {
-                println!("Reconnect handling...");
+            Some(Payload::Reconnect(reconnect)) => {
+                handle_reconnect(&server, &mut sessions, &mut rooms, addr, reconnect).await;
             }
 
             None => {
@@ -118,10 +158,113 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
-async fn handle_ping(server: &UdpServer,
-                     sessions: &mut SessionManager,
-                     addr: std::net::SocketAddr,
-                     ping: Ping) {
+async fn handle_reconnect(
+    server: &Arc<UdpServer>,
+    sessions: &mut SessionManager,
+    rooms: &mut RoomManager,
+    addr: SocketAddr,
+    reconnect: Reconnect,
+) {
+    let Some(session) =
+        sessions.reconnected_by_token(&reconnect.token, addr, reconnect.player_name.clone())
+    else {
+        let response = ServerMessage {
+            payload: Some(server_message::Payload::Error(Error {
+                message: "Reconnection failed: invalid token or grace period expired".to_string(),
+            })),
+        };
+        let _ = server.send(&response.encode_to_vec(), addr).await;
+        tracing::warn!("Failed reconnection attempt from {addr}");
+        return;
+    };
+
+    let player_id = session.player_id;
+    let reconnect_token = session.reconnect_token.clone();
+
+    let Some(room_code) = session.room_code.clone() else {
+        let response = ServerMessage {
+            payload: Some(server_message::Payload::RoomJoined(RoomJoined {
+                player_id,
+                room_code: String::new(),
+                players: vec![],
+                reconnect_token,
+            })),
+        };
+        let _ = server.send(&response.encode_to_vec(), addr).await;
+        tracing::info!("Player {} reconnected (no room)", player_id);
+        return;
+    };
+
+    let Some(room) = rooms.get_room(&room_code) else {
+        let response = ServerMessage {
+            payload: Some(server_message::Payload::Error(Error {
+                message: "Room no longer exists".to_string(),
+            })),
+        };
+
+        let _ = server.send(&response.encode_to_vec(), addr).await;
+
+        if let Some(session) = sessions.get_by_addr_mut(&addr) {
+            session.room_code = None;
+        }
+        return;
+    };
+
+    let players: Vec<PlayerInfo> = room
+        .players
+        .values()
+        .map(|p| PlayerInfo {
+            player_id: p.player_id,
+            name: p.name.clone(),
+            ready: p.ready,
+        })
+        .collect();
+
+    let player_ids = room.get_player_ids();
+
+    let response = ServerMessage {
+        payload: Some(server_message::Payload::RoomJoined(RoomJoined {
+            player_id,
+            room_code: room_code.clone(),
+            players: players.clone(),
+            reconnect_token,
+        })),
+    };
+
+    let _ = server.send(&response.encode_to_vec(), addr).await;
+
+    let reconnect_msg = ServerMessage {
+        payload: Some(server_message::Payload::PlayerReconnected(
+            PlayerReconnected { player_id },
+        )),
+    };
+
+    let reconnect_msg_bytes = reconnect_msg.encode_to_vec();
+
+    for pid in player_ids {
+        if pid != player_id {
+            if let Some(other) = sessions.get_by_player_id(pid) {
+                let _ = server
+                    .send(&reconnect_msg_bytes, other.addr)
+                    .await;
+            }
+        }
+    }
+
+    tracing::info!(
+        "Player {} ({}) reconnected to room {}",
+        player_id,
+        reconnect.player_name,
+        room_code
+    );
+}
+
+async fn handle_ping(
+    server: &UdpServer,
+    sessions: &mut SessionManager,
+    addr: std::net::SocketAddr,
+    ping: Ping,
+) {
     sessions.ping(&addr);
 
     if let Some(session) = sessions.get_by_addr(&addr) {
@@ -142,7 +285,7 @@ async fn handle_ping(server: &UdpServer,
             timestamp: ping.timestamp,
             sequence: ping.sequence,
             server_time: current_server_timestamp,
-        }))
+        })),
     };
 
     match server.send(&pong_message.encode_to_vec(), addr).await {
@@ -175,13 +318,15 @@ async fn handle_join_room(
             }
 
             // Build player list
-            let players: Vec<PlayerInfo> = room.players.values().map(|p| {
-                PlayerInfo {
+            let players: Vec<PlayerInfo> = room
+                .players
+                .values()
+                .map(|p| PlayerInfo {
                     player_id: p.player_id,
                     name: p.name.clone(),
                     ready: p.ready,
-                }
-            }).collect();
+                })
+                .collect();
 
             // Send RoomJoined to the joining player
             let response = ServerMessage {
@@ -196,9 +341,7 @@ async fn handle_join_room(
 
             // Notify other players in room
             let update = ServerMessage {
-                payload: Some(server_message::Payload::RoomUpdate(RoomUpdate {
-                    players,
-                })),
+                payload: Some(server_message::Payload::RoomUpdate(RoomUpdate { players })),
             };
             let update_bytes = update.encode_to_vec();
 
@@ -212,7 +355,10 @@ async fn handle_join_room(
 
             tracing::info!(
                 "Player {} ({}) joined room '{}' ({} players)",
-                player_id, join.player_name, room_code, player_count
+                player_id,
+                join.player_name,
+                room_code,
+                player_count
             );
         }
         Err(e) => {
@@ -279,26 +425,27 @@ async fn handle_ready(
             let player_ids = room.get_player_ids();
 
             // Build updated player list
-            let players: Vec<PlayerInfo> = room.players.values().map(|p| {
-                PlayerInfo {
+            let players: Vec<PlayerInfo> = room
+                .players
+                .values()
+                .map(|p| PlayerInfo {
                     player_id: p.player_id,
                     name: p.name.clone(),
                     ready: p.ready,
-                }
-            }).collect();
+                })
+                .collect();
 
             tracing::info!(
                 "Player {} ready in room {} ({}/{})",
-                player_id, room_code,
+                player_id,
+                room_code,
                 room.players.values().filter(|p| p.ready).count(),
                 player_count
             );
 
             // Notify all players of updated ready status
             let update = ServerMessage {
-                payload: Some(server_message::Payload::RoomUpdate(RoomUpdate {
-                    players,
-                })),
+                payload: Some(server_message::Payload::RoomUpdate(RoomUpdate { players })),
             };
             let update_bytes = update.encode_to_vec();
 
@@ -384,7 +531,11 @@ async fn handle_game_message(
         }
     }
 
-    tracing::trace!("Relayed message from player {} to room {}", player_id, room_code);
+    tracing::trace!(
+        "Relayed message from player {} to room {}",
+        player_id,
+        room_code
+    );
 }
 
 fn current_timestamp_ms() -> u64 {
