@@ -251,12 +251,12 @@ impl SessionManager {
         removed
     }
 
-    pub fn remove_(&mut self, addr: &SocketAddr) -> Option<Session> {
+    pub fn remove(&mut self, addr: &SocketAddr) -> Option<Session> {
         if let Some(session) = self.sessions_by_addr.remove(addr) {
             self.addr_by_player_id.remove(&session.player_id);
             self.token_to_player_id.remove(&session.reconnect_token);
             tracing::info!("Player disconnected: id={}, addr={}", session.player_id, addr);
-            
+
             Some(session)
         } else {
             None
