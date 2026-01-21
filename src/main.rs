@@ -189,7 +189,7 @@ async fn handle_join_room(
                     player_id,
                     room_code: room_code.clone(),
                     players: players.clone(),
-                    reconnect_token: reconnect_token,
+                    reconnect_token: "".to_string(),
                 })),
             };
             let _ = server.send(&response.encode_to_vec(), addr).await;

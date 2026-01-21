@@ -222,6 +222,47 @@ impl SessionManager {
         self.grace_period.as_secs() as u32
     }
 
+    pub fn cleanup_expired_disconnected(&mut self) -> Vec<Session> {
+        let now = Instant::now();
+
+        let expired_addrs: Vec<SocketAddr> = self
+            .sessions_by_addr
+            .iter()
+            .filter(|(_, session)| {
+                if session.connection_state == ConnectionState::Disconnected {
+                    if let Some(disconnected_at) = session.disconnected_at {
+                        return now.duration_since(disconnected_at) > self.grace_period;
+                    }
+                }
+                false
+            })
+            .map(|(addr, _)| *addr)
+            .collect();
+
+        let mut removed = Vec::new();
+
+        for addr in expired_addrs {
+            if let Some(session) = self.remove(&addr) {
+                tracing::info!("Player {} removed: grace period expired", session.player_id);
+                removed.push(session);
+            }
+        }
+
+        removed
+    }
+
+    pub fn remove_(&mut self, addr: &SocketAddr) -> Option<Session> {
+        if let Some(session) = self.sessions_by_addr.remove(addr) {
+            self.addr_by_player_id.remove(&session.player_id);
+            self.token_to_player_id.remove(&session.reconnect_token);
+            tracing::info!("Player disconnected: id={}, addr={}", session.player_id, addr);
+            
+            Some(session)
+        } else {
+            None
+        }
+    }
+
     // TODO:
     // 1. Move to helper file
     // 2. This is not a safe implementation. Have to be cryptographically secure
