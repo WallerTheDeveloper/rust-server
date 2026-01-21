@@ -107,6 +107,10 @@ async fn main() -> std::io::Result<()> {
                 handle_ping(&server, &mut sessions, addr, ping).await;
             }
 
+            Some(Payload::Reconnect(_)) => {
+                println!("Reconnect handling...");
+            }
+
             None => {
                 tracing::warn!("Empty message from {}", addr);
             }
@@ -185,6 +189,7 @@ async fn handle_join_room(
                     player_id,
                     room_code: room_code.clone(),
                     players: players.clone(),
+                    reconnect_token: reconnect_token,
                 })),
             };
             let _ = server.send(&response.encode_to_vec(), addr).await;

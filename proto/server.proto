@@ -13,6 +13,8 @@ message ServerMessage {
     PlayerLeft player_left = 6;
     Error error = 7;
     Pong pong = 8;
+    PlayerDisconnected player_disconnected = 9;
+    PlayerReconnected player_reconnected = 10;
   }
 }
 
@@ -20,6 +22,7 @@ message RoomJoined {
   uint32 player_id = 1;
   string room_code = 2;
   repeated PlayerInfo players = 3;
+  string reconnect_token = 4;
 }
 
 message PlayerInfo {
@@ -57,4 +60,13 @@ message Pong {
   uint64 timestamp = 1;
   uint32 sequence = 2;
   uint64 server_time = 3;
+}
+
+message PlayerDisconnected {
+  uint32 player_id = 1;
+  uint32 grace_period_seconds = 2;
+}
+
+message PlayerReconnected {
+  uint32 player_id = 1;
 }

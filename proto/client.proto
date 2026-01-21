@@ -8,6 +8,7 @@ message ClientMessage {
     Ready ready = 3;
     GameMessage game_message = 4;
     Ping ping = 5;
+    Reconnect reconnect = 6;
   }
 }
 
@@ -27,4 +28,9 @@ message GameMessage {
 message Ping {
   uint64 timestamp = 1;
   uint32 sequence = 2;
+}
+
+message Reconnect {
+  string token = 1;
+  string player_name = 2;
 }

@@ -1,0 +1,1 @@
+pub const GRACE_PLAYER_TIME_SECONDS: usize = 60;
