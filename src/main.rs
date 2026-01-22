@@ -7,6 +7,8 @@ use rust_server::protocol::server::{
 };
 use rust_server::room::{RoomManager, RoomState};
 use rust_server::session::SessionManager;
+use rust_server::config::SERVER_ADDR;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex};
@@ -20,7 +22,7 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let server = Arc::new(UdpServer::bind("127.0.0.1:9000").await?);
+    let server = Arc::new(UdpServer::bind(SERVER_ADDR).await?);
     tracing::info!("Relay server started");
 
     let sessions = Arc::new(Mutex::new(SessionManager::new(30)));

@@ -1,7 +1,7 @@
-use crate::config::GRACE_PLAYER_TIME_SECONDS;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+use crate::config::GRACE_PLAYER_TIME_SECONDS;
 
 pub type PlayerId = u32;
 

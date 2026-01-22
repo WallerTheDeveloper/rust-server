@@ -2,25 +2,24 @@ use prost::Message;
 use rust_server::protocol::client::{
     ClientMessage, GameMessage, JoinRoom, Ping, Ready, client_message::Payload, Reconnect
 };
+use rust_server::protocol::server::{ServerMessage, server_message};
 use std::io::Error;
 use std::net::UdpSocket;
 use std::thread;
 use std::time::Duration;
-
-use rust_server::protocol::server::{ServerMessage, server_message};
+use rust_server::config::SERVER_ADDR;
 
 fn main() -> std::io::Result<()> {
     let socket = UdpSocket::bind("127.0.0.1:0")?;
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let server_addr = "127.0.0.1:9000";
 
-    let _ = send_join_room_message(&socket, server_addr);
+    let _ = send_join_room_message(&socket, SERVER_ADDR);
 
     let reconnect_token = receive_and_extract_token(&socket);
     println!("Got reconnect token: {}", reconnect_token);
 
     for i in 1..=3 {
-        send_ping(&socket, server_addr, i);
+        send_ping(&socket, SERVER_ADDR, i);
         thread::sleep(Duration::from_millis(100));
     }
 
@@ -39,13 +38,13 @@ fn main() -> std::io::Result<()> {
             player_name: "Player1_Reconnected".to_string(),
         })),
     };
-    new_socket.send_to(&reconnect_msg.encode_to_vec(), server_addr)?;
+    new_socket.send_to(&reconnect_msg.encode_to_vec(), SERVER_ADDR)?;
     println!("Sent: Reconnect");
     receive_response(&new_socket);
 
     println!("\n--- Pings after reconnect ---");
     for i in 10..13 {
-        send_ping(&new_socket, server_addr, i);
+        send_ping(&new_socket, SERVER_ADDR, i);
         thread::sleep(Duration::from_secs(1));
     }
 
