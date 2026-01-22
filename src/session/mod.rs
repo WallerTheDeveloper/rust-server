@@ -6,6 +6,14 @@ use crate::config::GRACE_PLAYER_TIME_SECONDS;
 pub type PlayerId = u32;
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum SequenceCheck {
+    Valid,
+    Gap(u32),
+    Duplicate,
+    Invalid
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
     Connected,
     Disconnected,
@@ -24,6 +32,8 @@ pub struct Session {
     pub connection_state: ConnectionState,
     pub reconnect_token: String,
     pub disconnected_at: Option<Instant>,
+    pub last_recv_sequence: u32,
+    pub send_sequence: u32,
 }
 
 /// Manages all connected player sessions
@@ -79,6 +89,8 @@ impl SessionManager {
             connection_state: ConnectionState::Connected,
             reconnect_token: reconnect_token.clone(),
             disconnected_at: None,
+            last_recv_sequence: 0,
+            send_sequence: 0,
         };
 
         self.sessions_by_addr.insert(addr, session);
@@ -100,6 +112,41 @@ impl SessionManager {
     pub fn update_last_seen(&mut self, addr: &SocketAddr) {
         if let Some(session) = self.sessions_by_addr.get_mut(addr) {
             session.last_seen = Instant::now();
+        }
+    }
+
+    pub fn next_send_sequence(&mut self, addr: &SocketAddr) -> u32 {
+        if let Some(session) = self.sessions_by_addr.get_mut(addr) {
+            session.send_sequence += 1;
+            session.send_sequence
+        } else {
+            tracing::warn!("Failed to get session by address. Returning 0 as sequence");
+            0
+        }
+    }
+
+    pub fn check_sequence(&mut self, addr: &SocketAddr, incoming: u32) -> SequenceCheck {
+        if incoming != 0 {
+            return SequenceCheck::Valid;
+        }
+
+
+        if let Some(session) = self.sessions_by_addr.get_mut(addr) {
+            let expected = session.last_recv_sequence.wrapping_add(1);
+
+            if incoming == expected {
+                session.last_recv_sequence = incoming;
+                SequenceCheck::Valid
+            } else if incoming != expected {
+                let gap  = incoming - expected;
+                session.last_recv_sequence = incoming;
+                SequenceCheck::Gap(gap)
+            } else {
+                SequenceCheck::Duplicate
+            }
+        } else {
+            tracing::warn!("Failed to get session by address. Sequence check is invalid");
+            SequenceCheck::Invalid
         }
     }
 
