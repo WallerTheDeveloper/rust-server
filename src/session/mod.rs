@@ -126,7 +126,7 @@ impl SessionManager {
     }
 
     pub fn check_sequence(&mut self, addr: &SocketAddr, incoming: u32) -> SequenceCheck {
-        if incoming != 0 {
+        if incoming == 0 {
             return SequenceCheck::Valid;
         }
 
@@ -136,7 +136,7 @@ impl SessionManager {
             if incoming == expected {
                 session.last_recv_sequence = incoming;
                 SequenceCheck::Valid
-            } else if incoming != expected {
+            } else if incoming > expected {
                 let gap = incoming - expected;
                 session.last_recv_sequence = incoming;
                 tracing::warn!(
