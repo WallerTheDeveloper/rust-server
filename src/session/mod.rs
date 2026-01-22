@@ -1,7 +1,7 @@
+use crate::config::GRACE_PLAYER_TIME_SECONDS;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use crate::config::GRACE_PLAYER_TIME_SECONDS;
 
 pub type PlayerId = u32;
 
@@ -10,7 +10,7 @@ pub enum SequenceCheck {
     Valid,
     Gap(u32),
     Duplicate,
-    Invalid
+    Invalid,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +130,6 @@ impl SessionManager {
             return SequenceCheck::Valid;
         }
 
-
         if let Some(session) = self.sessions_by_addr.get_mut(addr) {
             let expected = session.last_recv_sequence.wrapping_add(1);
 
@@ -138,10 +137,20 @@ impl SessionManager {
                 session.last_recv_sequence = incoming;
                 SequenceCheck::Valid
             } else if incoming != expected {
-                let gap  = incoming - expected;
+                let gap = incoming - expected;
                 session.last_recv_sequence = incoming;
+                tracing::warn!(
+                    "Packet loss detected from player {}: {} packets missing",
+                    session.player_id,
+                    gap
+                );
                 SequenceCheck::Gap(gap)
             } else {
+                tracing::debug!(
+                    "Duplicate packet from player {} (seq={})",
+                    session.player_id,
+                    incoming
+                );
                 SequenceCheck::Duplicate
             }
         } else {
@@ -186,12 +195,11 @@ impl SessionManager {
             .sessions_by_addr
             .iter()
             .filter(|(_, session)| {
-                session.connection_state == ConnectionState::Connected &&
-                    now.duration_since(session.last_seen) > timeout
+                session.connection_state == ConnectionState::Connected
+                    && now.duration_since(session.last_seen) > timeout
             })
             .map(|(addr, _)| *addr)
             .collect();
-        
 
         let mut disconnected_players = Vec::new();
         for addr in timed_out_addrs {
@@ -302,7 +310,11 @@ impl SessionManager {
         if let Some(session) = self.sessions_by_addr.remove(addr) {
             self.addr_by_player_id.remove(&session.player_id);
             self.token_to_player_id.remove(&session.reconnect_token);
-            tracing::info!("Player disconnected: id={}, addr={}", session.player_id, addr);
+            tracing::info!(
+                "Player disconnected: id={}, addr={}",
+                session.player_id,
+                addr
+            );
 
             Some(session)
         } else {

@@ -1,4 +1,5 @@
 use prost::Message;
+use rust_server::config::SERVER_ADDR;
 use rust_server::network::udp::UdpServer;
 use rust_server::protocol::client::{ClientMessage, Ping, Reconnect, client_message::Payload};
 use rust_server::protocol::server::{
@@ -6,12 +7,11 @@ use rust_server::protocol::server::{
     PlayerLeft, PlayerReconnected, Pong, RoomJoined, RoomUpdate, ServerMessage, server_message,
 };
 use rust_server::room::{RoomManager, RoomState};
-use rust_server::session::SessionManager;
-use rust_server::config::SERVER_ADDR;
+use rust_server::session::{SequenceCheck, SessionManager};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{Mutex};
+use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -125,6 +125,20 @@ async fn main() -> std::io::Result<()> {
 
         let mut sessions = sessions.lock().await;
         let mut rooms = rooms.lock().await;
+
+        match sessions.check_sequence(&addr, msg.sequence) {
+            SequenceCheck::Valid => {}
+            SequenceCheck::Gap(gap) => {
+                tracing::warn!("Server detected packet loss");
+            }
+            SequenceCheck::Duplicate => {
+                tracing::warn!("Server detected duplicate packet");
+                continue;
+            }
+            SequenceCheck::Invalid => {
+                tracing::warn!("Server detected invalid packet");
+            }
+        }
 
         match msg.payload {
             Some(Payload::JoinRoom(join)) => {
@@ -244,9 +258,7 @@ async fn handle_reconnect(
     for pid in player_ids {
         if pid != player_id {
             if let Some(other) = sessions.get_by_player_id(pid) {
-                let _ = server
-                    .send(&reconnect_msg_bytes, other.addr)
-                    .await;
+                let _ = server.send(&reconnect_msg_bytes, other.addr).await;
             }
         }
     }
