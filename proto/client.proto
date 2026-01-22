@@ -10,6 +10,7 @@ message ClientMessage {
     Ping ping = 5;
     Reconnect reconnect = 6;
   }
+  uint32 sequence = 7;
 }
 
 message JoinRoom {
