@@ -305,6 +305,7 @@ async fn handle_join_room(
 ) {
     let session = sessions.register(addr, join.player_name.clone());
     let player_id = session.player_id;
+    let reconnect_token = session.reconnect_token.clone();
 
     match rooms.join_room(&join.room_code, player_id, join.player_name.clone()) {
         Ok(room) => {
@@ -334,7 +335,7 @@ async fn handle_join_room(
                     player_id,
                     room_code: room_code.clone(),
                     players: players.clone(),
-                    reconnect_token: "".to_string(),
+                    reconnect_token,
                 })),
             };
             let _ = server.send(&response.encode_to_vec(), addr).await;
