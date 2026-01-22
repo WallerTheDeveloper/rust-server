@@ -23,6 +23,8 @@ fn main() -> std::io::Result<()> {
     // Test packet loss detection
     test_packet_loss_detection(&socket, SERVER_ADDR);
 
+    send_seq = 110;
+    
     for i in 1..=3 {
         send_ping(&socket, SERVER_ADDR, i, &mut send_seq);
         thread::sleep(Duration::from_millis(100));

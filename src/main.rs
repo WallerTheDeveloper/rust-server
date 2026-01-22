@@ -313,12 +313,15 @@ async fn handle_ping(
         })),
     };
 
+    tracing::debug!("Sending Pong to {}", addr);
     match server.send(&pong_message.encode_to_vec(), addr).await {
         Ok(msg) => msg,
         Err(e) => {
             tracing::warn!("Failed to send pong: {}", e);
         }
     };
+    tracing::debug!("Sent Pong");
+
 }
 
 async fn handle_join_room(
@@ -364,7 +367,10 @@ async fn handle_join_room(
                     reconnect_token,
                 })),
             };
+
+            tracing::debug!("Sending RoomJoined to {}", addr);
             let _ = server.send(&response.encode_to_vec(), addr).await;
+            tracing::debug!("Sent RoomJoined");
 
             for pid in &player_ids {
                 if *pid != player_id {
