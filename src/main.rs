@@ -67,8 +67,6 @@ async fn main() -> std::io::Result<()> {
                             "Player {player_id} disconnected from room {room_code} (grace period: {grace_period_seconds}s)"
                         );
                     }
-                    // Notify others in room
-                    rooms.leave_room(session.player_id);
                 }
             }
 
