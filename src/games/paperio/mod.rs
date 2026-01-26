@@ -4,13 +4,15 @@ pub mod systems;
 
 use std::time::Duration;
 
-use crate::game::traits::{Game, GameConfig, GameError, PlayerId, TickResult};
+use prost::Message;
+use crate::game::traits::{Game, GameError, PlayerId, TickResult};
+use crate::protocol::paperio::PaperioInput;
 
 // Re-export commonly used types
-pub use config::PaperioConfig;
+pub use config::{PaperioConfig, get_player_color};
 pub use state::{Direction, GameState, GridPos, Player, TerritoryGrid};
 
-pub struct PaperGame {
+pub struct PaperioGame {
     /// Current game state
     state: GameState,
     /// Game configuration
@@ -19,7 +21,7 @@ pub struct PaperGame {
     tick: u32,
 }
 
-impl PaperGame {
+impl PaperioGame {
     pub fn new() -> Self {
         Self::with_config(PaperioConfig::default())
     }
@@ -36,47 +38,114 @@ impl PaperGame {
         self.tick
     }
 
-    pub fn get_state(&self) -> &GameState {
+    pub fn state(&self) -> &GameState {
         &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut GameState {
+        &mut self.state
+    }
+
+    pub fn config(&self) -> &PaperioConfig {
+        &self.config
     }
 }
 
-impl Default for PaperGame {
+impl Default for PaperioGame {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Game for PaperGame {
+impl Game for PaperioGame {
     fn tick(&mut self) -> TickResult {
         self.tick += 1;
+        let mut result = TickResult::default();
 
-        // TODO: Phase 3 - Implement movement system
-        // TODO: Phase 4 - Implement territory claiming
-        // TODO: Phase 5 - Implement collision detection
+        let ready_to_respawn = systems::update_timers(&mut self.state);
 
-        TickResult::default()
+        for player_id in ready_to_respawn {
+            if let Some(_pos) = systems::respawn_player(&mut self.state, player_id, &self.config) {
+                result.respawns.push(player_id);
+            }
+        }
+
+        let move_results = systems::update_movement(&mut self.state, &self.config);
+
+        for (player_id, move_result) in move_results {
+            if move_result.hit_boundary {
+                systems::eliminate_player(
+                    &mut self.state,
+                    player_id,
+                    systems::EliminationReason::Boundary,
+                    self.config.respawn_delay_ticks,
+                );
+                result.eliminated.push(player_id);
+            } else if move_result.should_claim {
+                for pos in &move_result.trail_to_claim {
+                    self.state.territory.set_cell_owner(pos, Some(player_id));
+                }
+            }
+        }
+
+        // TODO: Implement in Phase 5
+
+        systems::update_scores(&mut self.state);
+
+        result
     }
 
     fn handle_input(&mut self, player_id: PlayerId, input: &[u8]) -> Result<(), GameError> {
-        // TODO: Phase 3 - Parse PaperioInput and update player direction
-        let _ = (player_id, input);
+        let paperio_input = PaperioInput::decode(input)
+            .map_err(|e| GameError::InvalidInput(format!("Failed to decode input: {}", e)))?;
+
+        let direction = systems::direction_from_proto(paperio_input.direction);
+
+        systems::set_player_direction(&mut self.state, player_id, direction)
+            .map_err(|e| GameError::InvalidInput(e.to_string()))?;
+
         Ok(())
     }
 
     fn player_joined(&mut self, player_id: PlayerId, name: String) -> Result<Vec<u8>, GameError> {
-        // TODO: Phase 2 - Create player with spawn position and starting territory
-        let _ = (player_id, name);
+        let spawn_pos = systems::find_spawn_position(&self.state, &self.config)
+            .ok_or_else(|| GameError::InvalidState("No valid spawn position".to_string()))?;
+
+        let color = get_player_color(player_id);
+
+        let player = Player::new(player_id, name.clone(), spawn_pos, color);
+        self.state.players.insert(player_id, player);
+
+        systems::grant_starting_territory(
+            &mut self.state.territory,
+            player_id,
+            &spawn_pos,
+            self.config.starting_territory_size,
+        );
+
+        systems::update_scores(&mut self.state);
+
+        tracing::info!(
+            "Player {} ({}) joined at {:?}",
+            player_id, name, spawn_pos
+        );
+
         Ok(Vec::new())
     }
 
     fn player_left(&mut self, player_id: PlayerId) {
-        // TODO: Phase 2 - Remove player from game state
-        let _ = player_id;
+        if let Some(player) = self.state.players.remove(&player_id) {
+            let owned_cells = self.state.territory.get_owned_cells(player_id);
+            for pos in owned_cells {
+                self.state.territory.set_cell_owner(&pos, None);
+            }
+
+            tracing::info!("Player {} ({}) left the game", player_id, player.name);
+        }
     }
 
     fn encode_state(&self) -> Vec<u8> {
-        // TODO: Phase 2 - Encode GameState to PaperioState protobuf
+        // TODO: Phase 8 - Encode GameState to PaperioState protobuf
         Vec::new()
     }
 
@@ -94,10 +163,11 @@ impl Game for PaperGame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::traits::Game;
 
     #[test]
     fn test_game_creation() {
-        let game = PaperGame::new();
+        let game = PaperioGame::new();
         assert_eq!(game.current_tick(), 0);
         assert_eq!(game.config.grid_width, 100);
         assert_eq!(game.config.grid_height, 100);
@@ -105,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_tick_increments() {
-        let mut game = PaperGame::new();
+        let mut game = PaperioGame::new();
         assert_eq!(game.current_tick(), 0);
         game.tick();
         assert_eq!(game.current_tick(), 1);
@@ -115,8 +185,83 @@ mod tests {
 
     #[test]
     fn test_tick_rate() {
-        let game = PaperGame::new();
-        // Default is 20 Hz = 50ms per tick
+        let game = PaperioGame::new();
         assert_eq!(game.tick_rate(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn test_player_join() {
+        let mut game = PaperioGame::new();
+
+        let result = game.player_joined(1, "Alice".to_string());
+        assert!(result.is_ok());
+
+        let player = game.state().get_player(1);
+        assert!(player.is_some());
+
+        let player = player.unwrap();
+        assert_eq!(player.name, "Alice");
+        assert!(player.alive);
+
+        let owned = game.state().territory.count_owned_by(1);
+        assert!(owned > 0);
+    }
+
+    #[test]
+    fn test_player_leave() {
+        let mut game = PaperioGame::new();
+
+        game.player_joined(1, "Alice".to_string()).unwrap();
+        assert!(game.state().get_player(1).is_some());
+
+        game.player_left(1);
+        assert!(game.state().get_player(1).is_none());
+
+        let owned = game.state().territory.count_owned_by(1);
+        assert_eq!(owned, 0);
+    }
+
+    #[test]
+    fn test_handle_input_direction() {
+        let mut game = PaperioGame::new();
+        game.player_joined(1, "Alice".to_string()).unwrap();
+
+        let input = PaperioInput { direction: 1 }; // UP
+        let bytes = input.encode_to_vec();
+
+        let result = game.handle_input(1, &bytes);
+        assert!(result.is_ok());
+
+        let player = game.state().get_player(1).unwrap();
+        assert_eq!(player.direction, Direction::Up);
+    }
+
+    #[test]
+    fn test_full_tick_with_movement() {
+        let mut game = PaperioGame::new();
+        game.player_joined(1, "Alice".to_string()).unwrap();
+
+        let initial_pos = game.state().get_player(1).unwrap().position;
+
+        let input = PaperioInput { direction: 4 }; // RIGHT
+        game.handle_input(1, &input.encode_to_vec()).unwrap();
+
+        game.tick();
+
+        let new_pos = game.state().get_player(1).unwrap().position;
+        assert_eq!(new_pos.x, initial_pos.x + 1);
+        assert_eq!(new_pos.y, initial_pos.y);
+    }
+
+    #[test]
+    fn test_multiple_players() {
+        let mut game = PaperioGame::new();
+
+        game.player_joined(1, "Alice".to_string()).unwrap();
+        game.player_joined(2, "Bob".to_string()).unwrap();
+
+        assert_eq!(game.state().players.len(), 2);
+        assert!(game.state().get_player(1).is_some());
+        assert!(game.state().get_player(2).is_some());
     }
 }
