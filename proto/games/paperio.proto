@@ -1,0 +1,84 @@
+syntax = "proto3";
+package game.paperio;
+
+enum Direction {
+  DIRECTION_NONE = 0;
+  DIRECTION_UP = 1;
+  DIRECTION_DOWN = 2;
+  DIRECTION_LEFT = 3;
+  DIRECTION_RIGHT = 4;
+}
+
+message PaperioInput {
+  Direction direction = 1;
+}
+
+message GridPosition {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+message PaperioPlayer {
+  uint32 player_id = 1;
+  string name = 2;
+  GridPosition position = 3;
+  Direction direction = 4;
+  repeated GridPosition trail = 5;
+  bool alive = 6;
+  uint32 score = 7;
+  uint32 color = 8;
+}
+
+message TerritoryChunk {
+  uint32 owner_id = 1;
+  repeated GridPosition cells = 2;
+}
+
+message TerritoryRow {
+  int32 y = 1;
+  repeated TerritoryRun runs = 2;
+}
+
+message TerritoryRun {
+  uint32 owner_id = 1;
+  uint32 count = 2;
+}
+
+message PaperioState {
+  uint32 tick = 1;
+  repeated PaperioPlayer players = 2;
+  repeated TerritoryRow territory = 3;
+  uint32 grid_width = 4;
+  uint32 grid_height = 5;
+}
+
+message PaperioDelta {
+  uint32 tick = 1;
+  repeated PaperioPlayer changed_players = 2;
+  repeated TerritoryChunk territory_changes = 3;
+  repeated uint32 eliminated_players = 4;
+}
+
+message TerritoryClaimed {
+  uint32 player_id = 1;
+  uint32 cells_claimed = 2;
+  uint32 cells_stolen = 3;
+  repeated uint32 victims = 4;
+}
+
+message PlayerEliminated {
+  uint32 player_id = 1;
+  uint32 killer_id = 2;
+  string reason = 3;
+}
+
+message PlayerRespawned {
+  uint32 player_id = 1;
+  GridPosition spawn_position = 2;
+}
+
+message PaperioJoinResponse {
+  uint32 your_player_id = 1;
+  PaperioState initial_state = 2;
+  uint32 tick_rate_ms = 3;
+}
