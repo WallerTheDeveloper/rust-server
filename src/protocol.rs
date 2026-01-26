@@ -9,3 +9,7 @@ pub mod client {
 pub mod server {
     include!(concat!(env!("OUT_DIR"), "/game.server.rs"));
 }
+
+pub mod paperio {
+    include!(concat!(env!("OUT_DIR"), "/game.paperio.rs"));
+}

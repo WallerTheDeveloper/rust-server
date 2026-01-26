@@ -6,6 +6,7 @@ fn main() -> Result<()> {
             "proto/common.proto",
             "proto/client.proto",
             "proto/server.proto",
+            "proto/games/paperio.proto",
         ],
         &["proto/"],
     )?;
