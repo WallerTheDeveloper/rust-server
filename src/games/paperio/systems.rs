@@ -1,7 +1,7 @@
 use super::state::{Direction, GameState, GridPos, Player, TerritoryGrid};
 use super::config::PaperioConfig;
 use crate::game::traits::PlayerId;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque, HashMap};
 
 #[derive(Debug, Default)]
 pub struct MoveResult {
@@ -272,12 +272,7 @@ fn get_neighbors(pos: &GridPos) -> [GridPos; 4] {
     ]
 }
 
-pub fn check_collisions(_state: &GameState) -> Vec<Elimination> {
-    // TODO: Phase 5 implementation
-    Vec::new()
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Elimination {
     /// Player who was eliminated
     pub victim: PlayerId,
@@ -299,10 +294,146 @@ pub enum EliminationReason {
     Boundary,
 }
 
+impl std::fmt::Display for EliminationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EliminationReason::TrailCut => write!(f, "trail was cut"),
+            EliminationReason::SelfCollision => write!(f, "crossed own trail"),
+            EliminationReason::HeadCollision => write!(f, "head-on collision"),
+            EliminationReason::Boundary => write!(f, "hit boundary"),
+        }
+    }
+}
+
+pub fn check_collisions(state: &GameState) -> Vec<Elimination> {
+    let mut eliminations = Vec::new();
+    let mut already_eliminated: HashSet<PlayerId> = HashSet::new();
+
+    let alive_players: Vec<(PlayerId, GridPos, bool, &Vec<GridPos>)> = state.players
+        .values()
+        .filter(|p| p.alive)
+        .map(|p| (p.id, p.position, p.is_invulnerable(), &p.trail))
+        .collect();
+
+    let mut trail_map: HashMap<GridPos, PlayerId> = HashMap::new();
+    for (player_id, _, _, trail) in &alive_players {
+        for pos in *trail {
+            trail_map.insert(*pos, *player_id);
+        }
+    }
+
+    let mut position_map: HashMap<GridPos, Vec<PlayerId>> = HashMap::new();
+    for (player_id, position, _, _) in &alive_players {
+        position_map
+            .entry(*position)
+            .or_insert_with(Vec::new)
+            .push(*player_id);
+    }
+
+    for (player_id, position, is_invulnerable, own_trail) in &alive_players {
+        if *is_invulnerable {
+            continue;
+        }
+
+        if let Some(&trail_owner) = trail_map.get(position) {
+            if trail_owner == *player_id {
+                tracing::info!(
+                    "Player {} eliminated: crossed own trail at {:?}",
+                    player_id, position
+                );
+                eliminations.push(Elimination {
+                    victim: *player_id,
+                    killer: 0, // Self-caused
+                    reason: EliminationReason::SelfCollision,
+                });
+                already_eliminated.insert(*player_id);
+            } else {
+                if !already_eliminated.contains(&trail_owner) {
+                    let trail_owner_invulnerable = state.players
+                        .get(&trail_owner)
+                        .map(|p| p.is_invulnerable())
+                        .unwrap_or(false);
+
+                    if !trail_owner_invulnerable {
+                        tracing::info!(
+                            "Player {} eliminated: trail cut by player {} at {:?}",
+                            trail_owner, player_id, position
+                        );
+                        eliminations.push(Elimination {
+                            victim: trail_owner,
+                            killer: *player_id,
+                            reason: EliminationReason::TrailCut,
+                        });
+                        already_eliminated.insert(trail_owner);
+                    }
+                }
+            }
+        }
+    }
+
+    for (position, players_at_pos) in &position_map {
+        if players_at_pos.len() >= 2 {
+            let mut colliding_players: Vec<(PlayerId, u32, bool)> = players_at_pos
+                .iter()
+                .filter(|id| !already_eliminated.contains(id))
+                .filter_map(|id| {
+                    state.players.get(id).map(|p| (*id, p.score, p.is_invulnerable()))
+                })
+                .collect();
+
+            colliding_players.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let vulnerable_players: Vec<_> = colliding_players
+                .iter()
+                .filter(|(_, _, invuln)| !invuln)
+                .collect();
+
+            if vulnerable_players.len() >= 2 {
+                let top_score = vulnerable_players[0].1;
+                let tied_for_first: Vec<_> = vulnerable_players
+                    .iter()
+                    .filter(|(_, score, _)| *score == top_score)
+                    .collect();
+
+                if tied_for_first.len() >= 2 {
+                    for (player_id, _, _) in tied_for_first {
+                        tracing::info!(
+                            "Player {} eliminated: head-on collision (tied score) at {:?}",
+                            player_id, position
+                        );
+                        eliminations.push(Elimination {
+                            victim: *player_id,
+                            killer: 0, // Mutual elimination
+                            reason: EliminationReason::HeadCollision,
+                        });
+                        already_eliminated.insert(*player_id);
+                    }
+                } else {
+                    let winner_id = vulnerable_players[0].0;
+                    for (player_id, _, _) in vulnerable_players.iter().skip(1) {
+                        tracing::info!(
+                            "Player {} eliminated: head-on collision with {} at {:?}",
+                            player_id, winner_id, position
+                        );
+                        eliminations.push(Elimination {
+                            victim: *player_id,
+                            killer: winner_id,
+                            reason: EliminationReason::HeadCollision,
+                        });
+                        already_eliminated.insert(*player_id);
+                    }
+                }
+            }
+        }
+    }
+
+    eliminations
+}
+
 pub fn eliminate_player(
     state: &mut GameState,
     player_id: PlayerId,
-    _reason: EliminationReason,
+    reason: EliminationReason,
     respawn_delay: u32,
 ) {
     if let Some(player) = state.players.get_mut(&player_id) {
@@ -312,20 +443,93 @@ pub fn eliminate_player(
         player.respawn_timer = respawn_delay;
 
         tracing::info!(
-            "Player {} eliminated, respawning in {} ticks",
+            "Player {} eliminated ({}), respawning in {} ticks",
             player_id,
+            reason,
             respawn_delay
         );
     }
 }
 
 pub fn find_spawn_position(state: &GameState, config: &PaperioConfig) -> Option<GridPos> {
-    // TODO: Phase 5 implementation
     let (width, height) = state.territory.get_grid_dimensions();
-    let center = GridPos::new(width as i32 / 2, height as i32 / 2);
+    let margin = config.starting_territory_size as i32;
+    let min_distance = config.min_spawn_distance;
 
-    let _ = config;
-    Some(center)
+    // Get positions of all alive players
+    let occupied_positions: Vec<GridPos> = state.players
+        .values()
+        .filter(|p| p.alive)
+        .map(|p| p.position)
+        .collect();
+
+    if occupied_positions.is_empty() {
+        return Some(GridPos::new(width as i32 / 2, height as i32 / 2));
+    }
+
+    let center = GridPos::new(width as i32 / 2, height as i32 / 2);
+    let mut best_pos: Option<GridPos> = None;
+    let mut best_min_distance: u32 = 0;
+
+    for radius in 0..=(width.max(height) / 2) as i32 {
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                if dx.abs() != radius && dy.abs() != radius {
+                    continue;
+                }
+
+                let pos = center.offset(dx, dy);
+
+                if pos.x < margin || pos.x >= (width as i32 - margin) ||
+                    pos.y < margin || pos.y >= (height as i32 - margin) {
+                    continue;
+                }
+
+                let min_dist = occupied_positions
+                    .iter()
+                    .map(|other| pos.distance(other))
+                    .min()
+                    .unwrap_or(u32::MAX);
+
+                if min_dist >= min_distance {
+                    let area_clear = is_spawn_area_clear(
+                        &state.territory,
+                        &pos,
+                        config.starting_territory_size,
+                    );
+
+                    if area_clear {
+                        return Some(pos);
+                    }
+                }
+
+                if min_dist > best_min_distance {
+                    best_min_distance = min_dist;
+                    best_pos = Some(pos);
+                }
+            }
+        }
+    }
+
+    best_pos.or(Some(center))
+}
+
+fn is_spawn_area_clear(territory: &TerritoryGrid, center: &GridPos, size: u32) -> bool {
+    let half = (size / 2) as i32;
+    let mut claimed_count = 0;
+    let total_cells = (size * size) as i32;
+
+    for dy in -half..=half {
+        for dx in -half..=half {
+            let pos = center.offset(dx, dy);
+            if territory.get_cell_owner(&pos).is_some() {
+                claimed_count += 1;
+            }
+        }
+    }
+
+    // Allow spawn if less than 25% of the area is claimed
+    claimed_count < total_cells / 4
 }
 
 pub fn grant_starting_territory(
@@ -358,6 +562,11 @@ pub fn respawn_player(
         player.direction = Direction::None;
         player.trail.clear();
         player.invulnerability_timer = config.invulnerability_ticks;
+
+        tracing::info!(
+            "Player {} respawned at {:?} with {} ticks invulnerability",
+            player_id, spawn_pos, config.invulnerability_ticks
+        );
     }
 
     grant_starting_territory(
@@ -832,5 +1041,215 @@ mod tests {
         assert!(neighbors.contains(&GridPos::new(6, 5))); // Right
         assert!(neighbors.contains(&GridPos::new(5, 4))); // Up
         assert!(neighbors.contains(&GridPos::new(5, 6))); // Down
+    }
+
+    #[test]
+    fn test_self_collision() {
+        let mut state = setup_game_state();
+        setup_player_with_territory(&mut state, 1);
+
+        let player = state.players.get_mut(&1).unwrap();
+        player.trail = vec![
+            GridPos::new(12, 10),
+            GridPos::new(13, 10),
+            GridPos::new(14, 10),
+        ];
+        player.position = GridPos::new(13, 10);
+
+        let eliminations = check_collisions(&state);
+
+        assert_eq!(eliminations.len(), 1);
+        assert_eq!(eliminations[0].victim, 1);
+        assert_eq!(eliminations[0].reason, EliminationReason::SelfCollision);
+    }
+
+    #[test]
+    fn test_trail_cut_by_other_player() {
+        let mut state = setup_game_state();
+        setup_player_with_territory(&mut state, 1);
+        setup_player_with_territory(&mut state, 2);
+
+        let player1 = state.players.get_mut(&1).unwrap();
+        player1.position = GridPos::new(15, 10);
+        player1.trail = vec![
+            GridPos::new(12, 10),
+            GridPos::new(13, 10),
+            GridPos::new(14, 10),
+        ];
+
+        let player2 = state.players.get_mut(&2).unwrap();
+        player2.position = GridPos::new(13, 10); // On player 1's trail
+
+        let eliminations = check_collisions(&state);
+
+        assert_eq!(eliminations.len(), 1);
+        assert_eq!(eliminations[0].victim, 1);
+        assert_eq!(eliminations[0].killer, 2);
+        assert_eq!(eliminations[0].reason, EliminationReason::TrailCut);
+    }
+
+    #[test]
+    fn test_head_on_collision_different_scores() {
+        let mut state = setup_game_state();
+
+        let mut player1 = Player::new(1, "Player1".to_string(), GridPos::new(5, 5), 0xFF0000FF);
+        player1.score = 1000;
+        state.players.insert(1, player1);
+
+        let mut player2 = Player::new(2, "Player2".to_string(), GridPos::new(5, 5), 0x00FF00FF);
+        player2.score = 500;
+        state.players.insert(2, player2);
+
+        let eliminations = check_collisions(&state);
+
+        assert_eq!(eliminations.len(), 1);
+        assert_eq!(eliminations[0].victim, 2);
+        assert_eq!(eliminations[0].killer, 1);
+        assert_eq!(eliminations[0].reason, EliminationReason::HeadCollision);
+    }
+
+    #[test]
+    fn test_head_on_collision_same_score() {
+        let mut state = setup_game_state();
+
+        let mut player1 = Player::new(1, "Player1".to_string(), GridPos::new(5, 5), 0xFF0000FF);
+        player1.score = 500;
+        state.players.insert(1, player1);
+
+        let mut player2 = Player::new(2, "Player2".to_string(), GridPos::new(5, 5), 0x00FF00FF);
+        player2.score = 500;
+        state.players.insert(2, player2);
+
+        let eliminations = check_collisions(&state);
+
+        assert_eq!(eliminations.len(), 2);
+        let victims: HashSet<_> = eliminations.iter().map(|e| e.victim).collect();
+        assert!(victims.contains(&1));
+        assert!(victims.contains(&2));
+    }
+
+    #[test]
+    fn test_invulnerable_player_not_eliminated() {
+        let mut state = setup_game_state();
+        setup_player_with_territory(&mut state, 1);
+        setup_player_with_territory(&mut state, 2);
+
+        let player1 = state.players.get_mut(&1).unwrap();
+        player1.invulnerability_timer = 10;
+        player1.trail = vec![
+            GridPos::new(12, 10),
+            GridPos::new(13, 10),
+        ];
+
+        let player2 = state.players.get_mut(&2).unwrap();
+        player2.position = GridPos::new(13, 10);
+
+        let eliminations = check_collisions(&state);
+
+        assert!(eliminations.is_empty());
+    }
+
+    #[test]
+    fn test_eliminate_player_sets_state() {
+        let mut state = setup_game_state();
+        setup_player_with_territory(&mut state, 1);
+
+        // Add a trail
+        state.players.get_mut(&1).unwrap().trail = vec![
+            GridPos::new(12, 10),
+        ];
+
+        eliminate_player(&mut state, 1, EliminationReason::TrailCut, 60);
+
+        let player = state.get_player(1).unwrap();
+        assert!(!player.alive);
+        assert!(player.trail.is_empty());
+        assert_eq!(player.direction, Direction::None);
+        assert_eq!(player.respawn_timer, 60);
+    }
+
+    #[test]
+    fn test_find_spawn_position_empty_map() {
+        let state = GameState::new(100, 100);
+        let config = PaperioConfig::default();
+
+        let spawn_pos = find_spawn_position(&state, &config);
+
+        assert!(spawn_pos.is_some());
+        let pos = spawn_pos.unwrap();
+        // Should be near center for empty map
+        assert!(pos.x >= 40 && pos.x <= 60);
+        assert!(pos.y >= 40 && pos.y <= 60);
+    }
+
+    #[test]
+    fn test_find_spawn_position_with_players() {
+        let mut state = GameState::new(50, 50);
+        let config = PaperioConfig::default();
+
+        let player = Player::new(1, "Center".to_string(), GridPos::new(25, 25), 0xFF0000FF);
+        state.players.insert(1, player);
+        grant_starting_territory(&mut state.territory, 1, &GridPos::new(25, 25), 5);
+
+        let spawn_pos = find_spawn_position(&state, &config);
+
+        assert!(spawn_pos.is_some());
+        let pos = spawn_pos.unwrap();
+        let distance = pos.distance(&GridPos::new(25, 25));
+        assert!(distance >= config.min_spawn_distance,
+                "Spawn position {:?} too close to existing player (distance: {})", pos, distance);
+    }
+
+    #[test]
+    fn test_respawn_player_grants_invulnerability() {
+        let mut state = setup_game_state();
+        let config = PaperioConfig::default();
+
+        let player = Player::new(1, "Test".to_string(), GridPos::new(10, 10), 0xFF0000FF);
+        state.players.insert(1, player);
+        eliminate_player(&mut state, 1, EliminationReason::Boundary, 60);
+
+        // Respawn
+        let spawn_pos = respawn_player(&mut state, 1, &config);
+
+        assert!(spawn_pos.is_some());
+        let player = state.get_player(1).unwrap();
+        assert!(player.alive);
+        assert!(player.is_invulnerable());
+        assert_eq!(player.invulnerability_timer, config.invulnerability_ticks);
+    }
+
+    #[test]
+    fn test_no_collision_when_players_separated() {
+        let mut state = setup_game_state();
+        setup_player_with_territory(&mut state, 1);
+        setup_player_with_territory(&mut state, 2);
+
+        state.players.get_mut(&1).unwrap().position = GridPos::new(5, 5);
+        state.players.get_mut(&2).unwrap().position = GridPos::new(15, 15);
+
+        let eliminations = check_collisions(&state);
+
+        assert!(eliminations.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_trail_cuts_same_tick() {
+        let mut state = setup_game_state();
+
+        let mut player1 = Player::new(1, "P1".to_string(), GridPos::new(5, 5), 0xFF0000FF);
+        player1.trail = vec![GridPos::new(10, 10), GridPos::new(10, 11)];
+        state.players.insert(1, player1);
+
+        let mut player2 = Player::new(2, "P2".to_string(), GridPos::new(10, 10), 0x00FF00FF);
+        player2.trail = vec![GridPos::new(5, 5)];
+        state.players.insert(2, player2);
+
+        let eliminations = check_collisions(&state);
+
+        assert_eq!(eliminations.len(), 2);
+        let victims: HashSet<_> = eliminations.iter().map(|e| e.victim).collect();
+        assert!(victims.contains(&1));
+        assert!(victims.contains(&2));
     }
 }
