@@ -8,7 +8,6 @@ use prost::Message;
 use crate::game::traits::{Game, GameError, PlayerId, TickResult};
 use crate::protocol::paperio::PaperioInput;
 
-// Re-export commonly used types
 pub use config::{PaperioConfig, get_player_color};
 pub use state::{Direction, GameState, GridPos, Player, TerritoryGrid};
 
@@ -62,6 +61,7 @@ impl Game for PaperioGame {
         self.tick += 1;
         let mut result = TickResult::default();
 
+        // Step 1: Update timers and handle respawns
         let ready_to_respawn = systems::update_timers(&mut self.state);
 
         for player_id in ready_to_respawn {
@@ -82,13 +82,22 @@ impl Game for PaperioGame {
                 );
                 result.eliminated.push(player_id);
             } else if move_result.should_claim {
-                for pos in &move_result.trail_to_claim {
-                    self.state.territory.set_cell_owner(pos, Some(player_id));
-                }
+                let claim_result = systems::claim_territory(
+                    &mut self.state.territory,
+                    player_id,
+                    &move_result.trail_to_claim,
+                );
+
+                tracing::info!(
+                    "Player {} claimed {} cells ({} stolen)",
+                    player_id,
+                    claim_result.cells_claimed,
+                    claim_result.cells_stolen
+                );
             }
         }
 
-        // TODO: Implement in Phase 5
+        // (TODO: Phase 5) Check for collisions
 
         systems::update_scores(&mut self.state);
 
@@ -263,5 +272,40 @@ mod tests {
         assert_eq!(game.state().players.len(), 2);
         assert!(game.state().get_player(1).is_some());
         assert!(game.state().get_player(2).is_some());
+    }
+
+    #[test]
+    fn test_territory_claim_through_tick() {
+        let config = PaperioConfig::with_grid_size(20, 20);
+        let mut game = PaperioGame::with_config(config);
+
+        game.player_joined(1, "Alice".to_string()).unwrap();
+
+        let initial_territory = game.state().territory.count_owned_by(1);
+
+        game.handle_input(1, &PaperioInput { direction: 4 }.encode_to_vec()).unwrap();
+        for _ in 0..3 {
+            game.tick();
+        }
+
+        game.handle_input(1, &PaperioInput { direction: 2 }.encode_to_vec()).unwrap();
+        for _ in 0..3 {
+            game.tick();
+        }
+
+        game.handle_input(1, &PaperioInput { direction: 3 }.encode_to_vec()).unwrap();
+        for _ in 0..5 {
+            game.tick();
+        }
+
+        game.handle_input(1, &PaperioInput { direction: 1 }.encode_to_vec()).unwrap();
+        for _ in 0..5 {
+            game.tick();
+        }
+
+        let final_territory = game.state().territory.count_owned_by(1);
+
+        assert!(final_territory >= initial_territory,
+                "Territory should not decrease: {} -> {}", initial_territory, final_territory);
     }
 }

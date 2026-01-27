@@ -1,6 +1,7 @@
 use super::state::{Direction, GameState, GridPos, Player, TerritoryGrid};
 use super::config::PaperioConfig;
 use crate::game::traits::PlayerId;
+use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Default)]
 pub struct MoveResult {
@@ -125,15 +126,6 @@ pub fn direction_to_proto(direction: Direction) -> i32 {
     }
 }
 
-pub fn claim_territory(
-    _territory: &mut TerritoryGrid,
-    _player_id: PlayerId,
-    _trail: &[GridPos],
-) -> ClaimResult {
-    // TODO: Phase 4 implementation
-    ClaimResult::default()
-}
-
 #[derive(Debug, Default)]
 pub struct ClaimResult {
     /// Number of new cells claimed
@@ -144,17 +136,142 @@ pub struct ClaimResult {
     pub victims: Vec<PlayerId>,
 }
 
-fn flood_fill_from_edges(
-    _territory: &TerritoryGrid,
-    _player_id: PlayerId,
-    _trail: &[GridPos],
-) -> Vec<GridPos> {
-    // TODO: Phase 4 implementation
-    // Returns all cells that should become player's territory
-    Vec::new()
+
+pub fn claim_territory(
+    territory: &mut TerritoryGrid,
+    player_id: PlayerId,
+    trail: &[GridPos],
+) -> ClaimResult {
+    let mut result = ClaimResult::default();
+
+    if trail.is_empty() {
+        return result;
+    }
+
+    for pos in trail {
+        if territory.in_bounds(pos) {
+            let previous_owner = territory.get_cell_owner(pos);
+
+            if let Some(owner) = previous_owner {
+                if owner != player_id {
+                    result.cells_stolen += 1;
+                    if !result.victims.contains(&owner) {
+                        result.victims.push(owner);
+                    }
+                }
+            }
+
+            if previous_owner != Some(player_id) {
+                result.cells_claimed += 1;
+            }
+
+            territory.set_cell_owner(pos, Some(player_id));
+        }
+    }
+
+    let enclosed_cells = flood_fill_from_edges(territory, player_id);
+
+    for pos in enclosed_cells {
+        let previous_owner = territory.get_cell_owner(&pos);
+
+        if let Some(owner) = previous_owner {
+            if owner != player_id {
+                result.cells_stolen += 1;
+                if !result.victims.contains(&owner) {
+                    result.victims.push(owner);
+                }
+            }
+        }
+
+        result.cells_claimed += 1;
+        territory.set_cell_owner(&pos, Some(player_id));
+    }
+
+    tracing::debug!(
+        "Player {} claimed {} cells ({} stolen from {:?})",
+        player_id, result.cells_claimed, result.cells_stolen, result.victims
+    );
+
+    result
 }
 
-/// Check for all collisions and return eliminated players
+fn flood_fill_from_edges(
+    territory: &TerritoryGrid,
+    player_id: PlayerId,
+) -> Vec<GridPos> {
+    let (width, height) = territory.get_grid_dimensions();
+
+    let mut player_cells: HashSet<GridPos> = HashSet::new();
+    for y in 0..height {
+        for x in 0..width {
+            let pos = GridPos::new(x as i32, y as i32);
+            if territory.is_owned_by(&pos, player_id) {
+                player_cells.insert(pos);
+            }
+        }
+    }
+
+    let mut reachable: HashSet<GridPos> = HashSet::new();
+    let mut queue: VecDeque<GridPos> = VecDeque::new();
+
+    for x in 0..width {
+        let top = GridPos::new(x as i32, 0);
+        let bottom = GridPos::new(x as i32, (height - 1) as i32);
+
+        if !player_cells.contains(&top) && reachable.insert(top) {
+            queue.push_back(top);
+        }
+        if !player_cells.contains(&bottom) && reachable.insert(bottom) {
+            queue.push_back(bottom);
+        }
+    }
+
+    for y in 0..height {
+        let left = GridPos::new(0, y as i32);
+        let right = GridPos::new((width - 1) as i32, y as i32);
+
+        if !player_cells.contains(&left) && reachable.insert(left) {
+            queue.push_back(left);
+        }
+        if !player_cells.contains(&right) && reachable.insert(right) {
+            queue.push_back(right);
+        }
+    }
+
+    // BFS flood fill - spread to all connected non-player cells
+    while let Some(pos) = queue.pop_front() {
+        for neighbor in get_neighbors(&pos) {
+            if territory.in_bounds(&neighbor)
+                && !player_cells.contains(&neighbor)
+                && reachable.insert(neighbor)
+            {
+                queue.push_back(neighbor);
+            }
+        }
+    }
+
+    let mut enclosed = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let pos = GridPos::new(x as i32, y as i32);
+            if !reachable.contains(&pos) && !player_cells.contains(&pos) {
+                enclosed.push(pos);
+            }
+        }
+    }
+
+    enclosed
+}
+
+fn get_neighbors(pos: &GridPos) -> [GridPos; 4] {
+    [
+        pos.offset(-1, 0),  // Left
+        pos.offset(1, 0),   // Right
+        pos.offset(0, -1),  // Up
+        pos.offset(0, 1),   // Down
+    ]
+}
+
 pub fn check_collisions(_state: &GameState) -> Vec<Elimination> {
     // TODO: Phase 5 implementation
     Vec::new()
@@ -345,7 +462,6 @@ mod tests {
     fn test_update_scores() {
         let mut state = GameState::new(10, 10); // 100 cells
 
-        // Add a player
         state.players.insert(1, Player::new(
             1,
             "Test".to_string(),
@@ -399,7 +515,7 @@ mod tests {
         let mut state = setup_game_state();
         setup_player_with_territory(&mut state, 1);
 
-        state.players.get_mut(&1).unwrap().position = GridPos::new(11, 10); // Right edge of 3x3
+        state.players.get_mut(&1).unwrap().position = GridPos::new(11, 10);
 
         set_player_direction(&mut state, 1, Direction::Right).unwrap();
 
@@ -490,7 +606,7 @@ mod tests {
         assert_eq!(direction_from_proto(2), Direction::Down);
         assert_eq!(direction_from_proto(3), Direction::Left);
         assert_eq!(direction_from_proto(4), Direction::Right);
-        assert_eq!(direction_from_proto(99), Direction::None); // Invalid defaults to None
+        assert_eq!(direction_from_proto(99), Direction::None);
     }
 
     #[test]
@@ -535,5 +651,186 @@ mod tests {
 
         let ready = update_timers(&mut state);
         assert_eq!(ready, vec![1]);
+    }
+
+    #[test]
+    fn test_claim_simple_rectangle() {
+        let mut state = GameState::new(10, 10);
+        let center = GridPos::new(3, 3);
+
+        grant_starting_territory(&mut state.territory, 1, &center, 3);
+
+        let trail = vec![
+            GridPos::new(5, 4),
+            GridPos::new(5, 3),
+            GridPos::new(5, 2),
+            GridPos::new(4, 2),
+        ];
+
+        let result = claim_territory(&mut state.territory, 1, &trail);
+
+        assert!(result.cells_claimed > 0);
+
+        for pos in &trail {
+            assert!(state.territory.is_owned_by(pos, 1),
+                    "Trail cell {:?} should be owned by player 1", pos);
+        }
+    }
+
+    #[test]
+    fn test_claim_l_shaped_territory() {
+        let mut state = GameState::new(10, 10);
+        grant_starting_territory(&mut state.territory, 1, &GridPos::new(3, 3), 3);
+
+        let trail = vec![
+            GridPos::new(5, 3),
+            GridPos::new(5, 4),
+            GridPos::new(4, 4),
+            GridPos::new(4, 5),
+            GridPos::new(5, 5),
+            GridPos::new(6, 5),
+            GridPos::new(6, 4),
+            GridPos::new(6, 3),
+            GridPos::new(6, 2),
+            GridPos::new(5, 2),
+            GridPos::new(4, 2),
+        ];
+
+        let result = claim_territory(&mut state.territory, 1, &trail);
+
+        assert!(result.cells_claimed > 0, "Should claim some cells");
+
+        for pos in &trail {
+            assert!(state.territory.is_owned_by(pos, 1));
+        }
+    }
+
+    #[test]
+    fn test_claim_steals_enemy_territory() {
+
+        let mut state = GameState::new(10, 10);
+
+        grant_starting_territory(&mut state.territory, 1, &GridPos::new(2, 5), 3);
+
+        grant_starting_territory(&mut state.territory, 2, &GridPos::new(5, 5), 3);
+
+        let initial_p2_cells = state.territory.count_owned_by(2);
+
+        let trail = vec![
+            GridPos::new(4, 5),
+            GridPos::new(4, 4),
+            GridPos::new(4, 3),
+            GridPos::new(5, 3),
+            GridPos::new(6, 3),
+            GridPos::new(7, 3),
+            GridPos::new(7, 4),
+            GridPos::new(7, 5),
+            GridPos::new(7, 6),
+            GridPos::new(7, 7),
+            GridPos::new(6, 7),
+            GridPos::new(5, 7),
+            GridPos::new(4, 7),
+            GridPos::new(4, 6),
+            GridPos::new(3, 6),
+        ];
+
+        let result = claim_territory(&mut state.territory, 1, &trail);
+
+        assert!(result.cells_stolen > 0, "Should have stolen cells from player 2");
+        assert!(result.victims.contains(&2), "Player 2 should be in victims list");
+
+        let final_p2_cells = state.territory.count_owned_by(2);
+        assert!(final_p2_cells < initial_p2_cells,
+                "Player 2 should have lost territory: {} -> {}", initial_p2_cells, final_p2_cells);
+    }
+
+    #[test]
+    fn test_claim_no_enclosed_area() {
+
+        let mut state = GameState::new(10, 10);
+        grant_starting_territory(&mut state.territory, 1, &GridPos::new(5, 5), 3);
+
+        let trail = vec![
+            GridPos::new(7, 5),
+            GridPos::new(8, 5),
+            GridPos::new(9, 5),
+        ];
+
+        let result = claim_territory(&mut state.territory, 1, &trail);
+
+        assert_eq!(result.cells_claimed, 3);
+        assert_eq!(result.cells_stolen, 0);
+    }
+
+    #[test]
+    fn test_claim_empty_trail() {
+        let mut state = GameState::new(10, 10);
+        grant_starting_territory(&mut state.territory, 1, &GridPos::new(5, 5), 3);
+
+        let trail: Vec<GridPos> = vec![];
+        let result = claim_territory(&mut state.territory, 1, &trail);
+
+        assert_eq!(result.cells_claimed, 0);
+        assert_eq!(result.cells_stolen, 0);
+        assert!(result.victims.is_empty());
+    }
+
+    #[test]
+    fn test_flood_fill_finds_enclosed_cells() {
+        let mut territory = TerritoryGrid::new(10, 10);
+
+        for x in 2..=6 {
+            territory.set_cell_owner(&GridPos::new(x, 2), Some(1));
+            territory.set_cell_owner(&GridPos::new(x, 6), Some(1));
+        }
+        for y in 3..=5 {
+            territory.set_cell_owner(&GridPos::new(2, y), Some(1));
+            territory.set_cell_owner(&GridPos::new(6, y), Some(1));
+        }
+
+        let enclosed = flood_fill_from_edges(&territory, 1);
+
+        assert_eq!(enclosed.len(), 9, "Should find 9 enclosed cells in the center");
+
+        for pos in &enclosed {
+            assert!(pos.x >= 3 && pos.x <= 5 && pos.y >= 3 && pos.y <= 5,
+                    "Enclosed cell {:?} should be in center area", pos);
+        }
+    }
+
+    #[test]
+    fn test_flood_fill_no_enclosed_when_open() {
+        let mut territory = TerritoryGrid::new(10, 10);
+
+        // Create U-shape (open at top)
+        for x in 2..=6 {
+            territory.set_cell_owner(&GridPos::new(x, 6), Some(1)); // bottom
+        }
+        for y in 3..=5 {
+            territory.set_cell_owner(&GridPos::new(2, y), Some(1)); // left
+            territory.set_cell_owner(&GridPos::new(6, y), Some(1)); // right
+        }
+        // Top has gaps
+        territory.set_cell_owner(&GridPos::new(2, 2), Some(1));
+        territory.set_cell_owner(&GridPos::new(3, 2), Some(1));
+        territory.set_cell_owner(&GridPos::new(5, 2), Some(1));
+        territory.set_cell_owner(&GridPos::new(6, 2), Some(1));
+        // Gap at (4, 2)
+
+        let enclosed = flood_fill_from_edges(&territory, 1);
+
+        assert!(enclosed.is_empty(),
+                "Should have no enclosed cells when there's a gap, found: {:?}", enclosed);
+    }
+
+    #[test]
+    fn test_get_neighbors() {
+        let pos = GridPos::new(5, 5);
+        let neighbors = get_neighbors(&pos);
+
+        assert!(neighbors.contains(&GridPos::new(4, 5))); // Left
+        assert!(neighbors.contains(&GridPos::new(6, 5))); // Right
+        assert!(neighbors.contains(&GridPos::new(5, 4))); // Up
+        assert!(neighbors.contains(&GridPos::new(5, 6))); // Down
     }
 }
