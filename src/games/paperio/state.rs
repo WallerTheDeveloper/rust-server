@@ -98,11 +98,11 @@ impl Direction {
 
 pub struct TerritoryGrid {
     /// Width of the grid
-    width: u32,
+    pub width: u32,
     /// Height of the grid
-    height: u32,
+    pub height: u32,
     /// Ownership data: None = unclaimed, Some(id) = owned by player
-    cells: Vec<Option<PlayerId>>,
+    pub cells: Vec<Option<PlayerId>>,
 }
 
 impl TerritoryGrid {

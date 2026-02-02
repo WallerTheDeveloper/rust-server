@@ -3,5 +3,5 @@ pub mod network;
 pub mod room;
 pub mod session;
 pub mod config;
-mod game;
-mod games;
+pub mod game;
+pub mod games;

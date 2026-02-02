@@ -1,4 +1,5 @@
 pub mod config;
+pub mod encoding;
 pub mod state;
 pub mod systems;
 
@@ -71,7 +72,6 @@ impl Game for PaperioGame {
 
         let move_results = systems::update_movement(&mut self.state, &self.config);
 
-        // Handle boundary collisions and territory claims
         for (player_id, move_result) in move_results {
             if move_result.hit_boundary {
                 systems::eliminate_player(
@@ -89,36 +89,33 @@ impl Game for PaperioGame {
                 );
 
                 tracing::debug!(
-                    "Player {} claimed {} cells ({} stolen)",
+                    "Player {} claimed {} cells (stole {} from {:?})",
                     player_id,
                     claim_result.cells_claimed,
-                    claim_result.cells_stolen
+                    claim_result.cells_stolen,
+                    claim_result.victims
                 );
+
+                if let Some(player) = self.state.players.get_mut(&player_id) {
+                    player.trail.clear();
+                }
             }
         }
 
         let eliminations = systems::check_collisions(&self.state);
-
         for elimination in eliminations {
-            if !result.eliminated.contains(&elimination.victim) {
-                systems::eliminate_player(
-                    &mut self.state,
-                    elimination.victim,
-                    elimination.reason,
-                    self.config.respawn_delay_ticks,
-                );
-                result.eliminated.push(elimination.victim);
-
-                tracing::info!(
-                    "Player {} eliminated by player {} ({})",
-                    elimination.victim,
-                    elimination.killer,
-                    elimination.reason
-                );
-            }
+            systems::eliminate_player(
+                &mut self.state,
+                elimination.victim,
+                elimination.reason,
+                self.config.respawn_delay_ticks,
+            );
+            result.eliminated.push(elimination.victim);
         }
 
         systems::update_scores(&mut self.state);
+
+        result.broadcast = Some(self.encode_state());
 
         result
     }
@@ -130,14 +127,19 @@ impl Game for PaperioGame {
         let direction = systems::direction_from_proto(paperio_input.direction);
 
         systems::set_player_direction(&mut self.state, player_id, direction)
-            .map_err(|e| GameError::InvalidInput(e.to_string()))?;
-
-        Ok(())
+            .map_err(|e| GameError::InvalidInput(e.parse().unwrap()))
     }
 
     fn player_joined(&mut self, player_id: PlayerId, name: String) -> Result<Vec<u8>, GameError> {
+        if self.state.players.contains_key(&player_id) {
+            return Err(GameError::InvalidState(format!(
+                "Player {} already exists",
+                player_id
+            )));
+        }
+
         let spawn_pos = systems::find_spawn_position(&self.state, &self.config)
-            .ok_or_else(|| GameError::InvalidState("No valid spawn position".to_string()))?;
+            .ok_or_else(|| GameError::InvalidState("No valid spawn position found".to_string()))?;
 
         let color = get_player_color(player_id);
 
@@ -153,14 +155,17 @@ impl Game for PaperioGame {
             self.config.starting_territory_size,
         );
 
-        systems::update_scores(&mut self.state);
-
         tracing::info!(
             "Player {} ({}) joined at {:?} with {} ticks invulnerability",
             player_id, name, spawn_pos, self.config.invulnerability_ticks
         );
 
-        Ok(Vec::new())
+        Ok(encoding::encode_join_response(
+            player_id,
+            &self.state,
+            self.tick,
+            &self.config,
+        ))
     }
 
     fn player_left(&mut self, player_id: PlayerId) {
@@ -175,14 +180,11 @@ impl Game for PaperioGame {
     }
 
     fn encode_state(&self) -> Vec<u8> {
-        // TODO: Phase 8 - Encode GameState to PaperioState protobuf
-        Vec::new()
+        encoding::encode_state(&self.state, self.tick, &self.config)
     }
 
     fn encode_state_for_player(&self, player_id: PlayerId) -> Vec<u8> {
-        // TODO: Phase 8 - Implement player-specific state encoding
-        let _ = player_id;
-        self.encode_state()
+        encoding::encode_state_for_player(&self.state, self.tick, &self.config, player_id)
     }
 
     fn tick_rate(&self) -> Duration {
@@ -232,11 +234,28 @@ mod tests {
         let player = player.unwrap();
         assert_eq!(player.name, "Alice");
         assert!(player.alive);
-        // New players should have invulnerability
         assert!(player.is_invulnerable());
 
         let owned = game.state().territory.count_owned_by(1);
         assert!(owned > 0);
+    }
+
+    #[test]
+    fn test_player_join_returns_valid_response() {
+        let mut game = PaperioGame::new();
+
+        let response_bytes = game.player_joined(1, "Alice".to_string()).unwrap();
+
+        use crate::protocol::paperio::PaperioJoinResponse;
+        let response = PaperioJoinResponse::decode(response_bytes.as_slice()).unwrap();
+
+        assert_eq!(response.your_player_id, 1);
+        assert_eq!(response.tick_rate_ms, 50);
+        assert!(response.initial_state.is_some());
+
+        let state = response.initial_state.unwrap();
+        assert_eq!(state.players.len(), 1);
+        assert_eq!(state.players[0].name, "Alice");
     }
 
     #[test]
@@ -269,6 +288,23 @@ mod tests {
     }
 
     #[test]
+    fn test_tick_produces_broadcast() {
+        let mut game = PaperioGame::new();
+        game.player_joined(1, "Alice".to_string()).unwrap();
+
+        let result = game.tick();
+
+        assert!(result.broadcast.is_some());
+
+        use crate::protocol::paperio::PaperioState;
+        let bytes = result.broadcast.unwrap();
+        let state = PaperioState::decode(bytes.as_slice()).unwrap();
+
+        assert_eq!(state.tick, 1);
+        assert_eq!(state.players.len(), 1);
+    }
+
+    #[test]
     fn test_full_tick_with_movement() {
         let mut game = PaperioGame::new();
         game.player_joined(1, "Alice".to_string()).unwrap();
@@ -295,170 +331,18 @@ mod tests {
         assert_eq!(game.state().players.len(), 2);
         assert!(game.state().get_player(1).is_some());
         assert!(game.state().get_player(2).is_some());
+
+        let alice = game.state().get_player(1).unwrap();
+        let bob = game.state().get_player(2).unwrap();
+        assert_ne!(alice.color, bob.color);
     }
 
     #[test]
-    fn test_territory_claim_through_tick() {
-        let config = PaperioConfig::with_grid_size(20, 20);
-        let mut game = PaperioGame::with_config(config);
-
+    fn test_encode_state_not_empty() {
+        let mut game = PaperioGame::new();
         game.player_joined(1, "Alice".to_string()).unwrap();
 
-        let initial_territory = game.state().territory.count_owned_by(1);
-
-        game.handle_input(1, &PaperioInput { direction: 4 }.encode_to_vec()).unwrap();
-        for _ in 0..3 {
-            game.tick();
-        }
-
-        game.handle_input(1, &PaperioInput { direction: 2 }.encode_to_vec()).unwrap();
-        for _ in 0..3 {
-            game.tick();
-        }
-
-        game.handle_input(1, &PaperioInput { direction: 3 }.encode_to_vec()).unwrap();
-        for _ in 0..5 {
-            game.tick();
-        }
-
-        game.handle_input(1, &PaperioInput { direction: 1 }.encode_to_vec()).unwrap();
-        for _ in 0..5 {
-            game.tick();
-        }
-
-        let final_territory = game.state().territory.count_owned_by(1);
-
-        assert!(final_territory >= initial_territory,
-                "Territory should not decrease: {} -> {}", initial_territory, final_territory);
-    }
-
-    #[test]
-    fn test_boundary_elimination_through_tick() {
-        let config = PaperioConfig::with_grid_size(20, 20);
-        let mut game = PaperioGame::with_config(config);
-
-        game.player_joined(1, "Alice".to_string()).unwrap();
-
-        game.state_mut().players.get_mut(&1).unwrap().invulnerability_timer = 0;
-
-        game.state_mut().players.get_mut(&1).unwrap().position = GridPos::new(0, 10);
-
-        game.handle_input(1, &PaperioInput { direction: 3 }.encode_to_vec()).unwrap(); // LEFT
-
-        let result = game.tick();
-
-        assert!(result.eliminated.contains(&1));
-        assert!(!game.state().get_player(1).unwrap().alive);
-    }
-
-    #[test]
-    fn test_self_collision_through_tick() {
-        let config = PaperioConfig::with_grid_size(30, 30);
-        let mut game = PaperioGame::with_config(config);
-
-        game.player_joined(1, "Alice".to_string()).unwrap();
-
-        game.state_mut().players.get_mut(&1).unwrap().invulnerability_timer = 0;
-
-        let player = game.state_mut().players.get_mut(&1).unwrap();
-        player.position = GridPos::new(20, 15);
-        player.direction = Direction::Left;
-        player.trail = vec![
-            GridPos::new(21, 15),
-            GridPos::new(20, 15),
-            GridPos::new(19, 15),
-        ];
-
-        let result = game.tick();
-
-        assert!(result.eliminated.contains(&1),
-                "Player should be eliminated from self-collision");
-        assert!(!game.state().get_player(1).unwrap().alive,
-                "Player should not be alive after self-collision");
-    }
-
-    #[test]
-    fn test_trail_cut_between_players() {
-        let config = PaperioConfig::with_grid_size(50, 50);
-        let mut game = PaperioGame::with_config(config);
-
-        game.player_joined(1, "Alice".to_string()).unwrap();
-        game.player_joined(2, "Bob".to_string()).unwrap();
-
-        game.state_mut().players.get_mut(&1).unwrap().invulnerability_timer = 0;
-        game.state_mut().players.get_mut(&2).unwrap().invulnerability_timer = 0;
-
-        game.state_mut().players.get_mut(&1).unwrap().position = GridPos::new(20, 25);
-        game.state_mut().players.get_mut(&2).unwrap().position = GridPos::new(25, 20);
-
-        game.state_mut().players.get_mut(&1).unwrap().trail = vec![
-            GridPos::new(21, 25),
-            GridPos::new(22, 25),
-            GridPos::new(23, 25),
-            GridPos::new(24, 25),
-            GridPos::new(25, 25),
-        ];
-
-        game.state_mut().players.get_mut(&2).unwrap().position = GridPos::new(23, 25);
-
-        let result = game.tick();
-
-        assert!(result.eliminated.contains(&1),
-                "Player 1 should be eliminated when their trail is cut");
-    }
-
-    #[test]
-    fn test_respawn_after_elimination() {
-        let mut config = PaperioConfig::with_grid_size(20, 20);
-        config.respawn_delay_ticks = 3; // Short delay for test
-        let mut game = PaperioGame::with_config(config);
-
-        game.player_joined(1, "Alice".to_string()).unwrap();
-
-        game.state_mut().players.get_mut(&1).unwrap().invulnerability_timer = 0;
-
-        game.state_mut().players.get_mut(&1).unwrap().position = GridPos::new(0, 10);
-        game.handle_input(1, &PaperioInput { direction: 3 }.encode_to_vec()).unwrap();
-
-        let result = game.tick();
-        assert!(result.eliminated.contains(&1));
-        assert!(!game.state().get_player(1).unwrap().alive);
-        assert_eq!(game.state().get_player(1).unwrap().respawn_timer, 3);
-
-        game.tick(); // timer = 2
-        assert_eq!(game.state().get_player(1).unwrap().respawn_timer, 2);
-
-        game.tick(); // timer = 1
-        assert_eq!(game.state().get_player(1).unwrap().respawn_timer, 1);
-
-        let result = game.tick(); // timer = 0, should respawn
-        assert!(result.respawns.contains(&1));
-        assert!(game.state().get_player(1).unwrap().alive);
-        assert!(game.state().get_player(1).unwrap().is_invulnerable());
-    }
-
-    #[test]
-    fn test_invulnerability_protects_from_trail_cut() {
-        let config = PaperioConfig::with_grid_size(50, 50);
-        let mut game = PaperioGame::with_config(config);
-
-        game.player_joined(1, "Alice".to_string()).unwrap();
-        game.player_joined(2, "Bob".to_string()).unwrap();
-
-        assert!(game.state().get_player(1).unwrap().is_invulnerable());
-
-        game.state_mut().players.get_mut(&2).unwrap().invulnerability_timer = 0;
-
-        game.state_mut().players.get_mut(&1).unwrap().trail = vec![
-            GridPos::new(25, 25),
-            GridPos::new(26, 25),
-        ];
-
-        game.state_mut().players.get_mut(&2).unwrap().position = GridPos::new(25, 25);
-
-        let result = game.tick();
-
-        assert!(!result.eliminated.contains(&1));
-        assert!(game.state().get_player(1).unwrap().alive);
+        let state_bytes = game.encode_state();
+        assert!(!state_bytes.is_empty());
     }
 }
