@@ -177,7 +177,6 @@ async fn main() -> std::io::Result<()> {
                 handle_game_message(&mut state, addr, game_msg.payload);
             }
             Some(Payload::Ping(ping)) => {
-                tracing::debug!("-----Received Ping: {:#?}-----", ping);
                 handle_ping(&server, &mut state, addr, ping).await;
             }
             Some(Payload::Reconnect(reconnect)) => {
