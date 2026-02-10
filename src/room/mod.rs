@@ -37,7 +37,7 @@ impl Room {
     }
 
     pub fn add_player(&mut self, player_id: PlayerId, name: String) -> Result<(), RoomError> {
-        if self.state != RoomState::Waiting {
+        if self.state == RoomState::Ended {
             return Err(RoomError::GameInProgress);
         }
 

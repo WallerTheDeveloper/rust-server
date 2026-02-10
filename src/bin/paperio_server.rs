@@ -359,6 +359,41 @@ async fn handle_join_room(
             }
 
             tracing::info!("Player {} joined room '{}'", player_id, room_code);
+            if let Some(room) = state.rooms.get_room(&room_code) {
+                if room.state == RoomState::Playing {
+                    if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
+                        match game_room.add_player(player_id, addr, join.player_name.clone()) {
+                            Ok(join_response) => {
+                                // Send GameStarting with no countdown
+                                let starting = ServerMessage {
+                                    sequence: state.sessions.next_send_sequence(&addr),
+                                    payload: Some(server_message::Payload::GameStarting(GameStarting {
+                                        countdown_seconds: 0,
+                                    })),
+                                };
+                                let _ = server.send(&starting.encode_to_vec(), addr).await;
+
+                                // Send initial game state
+                                let game_msg = ServerMessage {
+                                    sequence: state.sessions.next_send_sequence(&addr),
+                                    payload: Some(server_message::Payload::GameMessage(
+                                        ServerGameMessage {
+                                            from_player_id: 0,
+                                            payload: join_response,
+                                        },
+                                    )),
+                                };
+                                let _ = server.send(&game_msg.encode_to_vec(), addr).await;
+
+                                tracing::info!("Late joiner {} added to active game in room {}", player_id, room_code);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to add late joiner {} to game: {}", player_id, e);
+                            }
+                        }
+                    }
+                }
+            }
         }
         Err(e) => {
             let error_msg = ServerMessage {
