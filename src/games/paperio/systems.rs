@@ -60,6 +60,7 @@ fn move_player(state: &mut GameState, player_id: PlayerId, config: &PaperioConfi
     }
 
     if now_in_territory && player.has_trail() {
+        add_to_trail(player, current_pos);
         add_to_trail(player, new_pos);
 
         result.trail_to_claim = player.trail.clone();
