@@ -18,6 +18,10 @@ pub struct PaperioConfig {
     pub invulnerability_ticks: u32,
     /// Minimum distance between spawn points
     pub min_spawn_distance: u32,
+    /// How many ticks between full keyframe states.
+    /// At 20Hz tick rate, 20 = one keyframe per second.
+    /// Between keyframes, only changed cells are sent.
+    pub keyframe_interval: u32,
 }
 
 impl PaperioConfig {
@@ -49,6 +53,7 @@ impl Default for PaperioConfig {
             respawn_delay_ticks: 60,
             invulnerability_ticks: 40,
             min_spawn_distance: 15,
+            keyframe_interval: 20,
         }
     }
 }
@@ -87,6 +92,7 @@ mod tests {
         assert_eq!(config.grid_height, 100);
         assert_eq!(config.tick_rate_hz, 20);
         assert_eq!(config.tick_duration(), Duration::from_millis(50));
+        assert_eq!(config.keyframe_interval, 20);
     }
 
     #[test]
@@ -97,10 +103,8 @@ mod tests {
 
     #[test]
     fn test_player_colors() {
-        // Colors should cycle
         assert_eq!(get_player_color(0), get_player_color(16));
         assert_eq!(get_player_color(1), get_player_color(17));
-        // But adjacent should differ
         assert_ne!(get_player_color(0), get_player_color(1));
     }
 }

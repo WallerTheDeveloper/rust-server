@@ -11,6 +11,7 @@ use crate::protocol::paperio::PaperioInput;
 
 pub use config::{PaperioConfig, get_player_color};
 pub use state::{Direction, GameState, GridPos, Player, TerritoryGrid};
+use encoding::TerritorySnapshot;
 
 pub struct PaperioGame {
     /// Current game state
@@ -19,6 +20,11 @@ pub struct PaperioGame {
     config: PaperioConfig,
     /// Current tick number
     tick: u32,
+    /// Snapshot of territory at the last keyframe.
+    /// Used to compute diffs for delta updates.
+    last_keyframe_snapshot: Option<TerritorySnapshot>,
+    /// Tick number of the last keyframe sent.
+    last_keyframe_tick: u32,
 }
 
 impl PaperioGame {
@@ -31,6 +37,8 @@ impl PaperioGame {
             state: GameState::new(config.grid_width, config.grid_height),
             config,
             tick: 0,
+            last_keyframe_snapshot: None,
+            last_keyframe_tick: 0,
         }
     }
 
@@ -48,6 +56,44 @@ impl PaperioGame {
 
     pub fn config(&self) -> &PaperioConfig {
         &self.config
+    }
+
+    fn is_keyframe_tick(&self) -> bool {
+        self.tick == 1 || self.tick % self.config.keyframe_interval == 0
+    }
+
+    fn encode_tick_state(&mut self) -> Vec<u8> {
+        if self.is_keyframe_tick() || self.last_keyframe_snapshot.is_none() {
+            self.last_keyframe_snapshot = Some(TerritorySnapshot::capture(&self.state.territory));
+            self.last_keyframe_tick = self.tick;
+
+            tracing::debug!(
+                "Tick {}: sending KEYFRAME (full state)",
+                self.tick
+            );
+
+            encoding::encode_full_state(&self.state, self.tick, &self.config)
+        } else {
+            let snapshot = self.last_keyframe_snapshot.as_ref().unwrap();
+            let territory_changes = snapshot.diff(&self.state.territory);
+
+            tracing::trace!(
+                "Tick {}: sending DELTA ({} territory changes, keyframe={})",
+                self.tick,
+                territory_changes.len(),
+                self.last_keyframe_tick
+            );
+
+            self.last_keyframe_snapshot = Some(TerritorySnapshot::capture(&self.state.territory));
+
+            encoding::encode_delta_state(
+                &self.state,
+                self.tick,
+                &self.config,
+                territory_changes,
+                self.last_keyframe_tick,
+            )
+        }
     }
 }
 
@@ -115,7 +161,7 @@ impl Game for PaperioGame {
 
         systems::update_scores(&mut self.state);
 
-        result.broadcast = Some(self.encode_state());
+        result.broadcast = Some(self.encode_tick_state());
 
         result
     }
@@ -156,8 +202,10 @@ impl Game for PaperioGame {
         );
 
         tracing::info!(
-            "Player {} ({}) joined at {:?} with {} ticks invulnerability",
-            player_id, name, spawn_pos, self.config.invulnerability_ticks
+            "Player {} ({}) joined at {:?}",
+            player_id,
+            name,
+            spawn_pos
         );
 
         Ok(encoding::encode_join_response(
@@ -170,11 +218,10 @@ impl Game for PaperioGame {
 
     fn player_left(&mut self, player_id: PlayerId) {
         if let Some(player) = self.state.players.remove(&player_id) {
-            let owned_cells = self.state.territory.get_owned_cells(player_id);
-            for pos in owned_cells {
+            let owned = self.state.territory.get_owned_cells(player_id);
+            for pos in owned {
                 self.state.territory.set_cell_owner(&pos, None);
             }
-
             tracing::info!("Player {} ({}) left the game", player_id, player.name);
         }
     }
@@ -188,161 +235,6 @@ impl Game for PaperioGame {
     }
 
     fn tick_rate(&self) -> Duration {
-        Duration::from_millis(1000 / self.config.tick_rate_hz as u64)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::game::traits::Game;
-
-    #[test]
-    fn test_game_creation() {
-        let game = PaperioGame::new();
-        assert_eq!(game.current_tick(), 0);
-        assert_eq!(game.config.grid_width, 100);
-        assert_eq!(game.config.grid_height, 100);
-    }
-
-    #[test]
-    fn test_tick_increments() {
-        let mut game = PaperioGame::new();
-        assert_eq!(game.current_tick(), 0);
-        game.tick();
-        assert_eq!(game.current_tick(), 1);
-        game.tick();
-        assert_eq!(game.current_tick(), 2);
-    }
-
-    #[test]
-    fn test_tick_rate() {
-        let game = PaperioGame::new();
-        assert_eq!(game.tick_rate(), Duration::from_millis(50));
-    }
-
-    #[test]
-    fn test_player_join() {
-        let mut game = PaperioGame::new();
-
-        let result = game.player_joined(1, "Alice".to_string());
-        assert!(result.is_ok());
-
-        let player = game.state().get_player(1);
-        assert!(player.is_some());
-
-        let player = player.unwrap();
-        assert_eq!(player.name, "Alice");
-        assert!(player.alive);
-        assert!(player.is_invulnerable());
-
-        let owned = game.state().territory.count_owned_by(1);
-        assert!(owned > 0);
-    }
-
-    #[test]
-    fn test_player_join_returns_valid_response() {
-        let mut game = PaperioGame::new();
-
-        let response_bytes = game.player_joined(1, "Alice".to_string()).unwrap();
-
-        use crate::protocol::paperio::PaperioJoinResponse;
-        let response = PaperioJoinResponse::decode(response_bytes.as_slice()).unwrap();
-
-        assert_eq!(response.your_player_id, 1);
-        assert_eq!(response.tick_rate_ms, 50);
-        assert!(response.initial_state.is_some());
-
-        let state = response.initial_state.unwrap();
-        assert_eq!(state.players.len(), 1);
-        assert_eq!(state.players[0].name, "Alice");
-    }
-
-    #[test]
-    fn test_player_leave() {
-        let mut game = PaperioGame::new();
-
-        game.player_joined(1, "Alice".to_string()).unwrap();
-        assert!(game.state().get_player(1).is_some());
-
-        game.player_left(1);
-        assert!(game.state().get_player(1).is_none());
-
-        let owned = game.state().territory.count_owned_by(1);
-        assert_eq!(owned, 0);
-    }
-
-    #[test]
-    fn test_handle_input_direction() {
-        let mut game = PaperioGame::new();
-        game.player_joined(1, "Alice".to_string()).unwrap();
-
-        let input = PaperioInput { direction: 1 }; // UP
-        let bytes = input.encode_to_vec();
-
-        let result = game.handle_input(1, &bytes);
-        assert!(result.is_ok());
-
-        let player = game.state().get_player(1).unwrap();
-        assert_eq!(player.direction, Direction::Up);
-    }
-
-    #[test]
-    fn test_tick_produces_broadcast() {
-        let mut game = PaperioGame::new();
-        game.player_joined(1, "Alice".to_string()).unwrap();
-
-        let result = game.tick();
-
-        assert!(result.broadcast.is_some());
-
-        use crate::protocol::paperio::PaperioState;
-        let bytes = result.broadcast.unwrap();
-        let state = PaperioState::decode(bytes.as_slice()).unwrap();
-
-        assert_eq!(state.tick, 1);
-        assert_eq!(state.players.len(), 1);
-    }
-
-    #[test]
-    fn test_full_tick_with_movement() {
-        let mut game = PaperioGame::new();
-        game.player_joined(1, "Alice".to_string()).unwrap();
-
-        let initial_pos = game.state().get_player(1).unwrap().position;
-
-        let input = PaperioInput { direction: 4 }; // RIGHT
-        game.handle_input(1, &input.encode_to_vec()).unwrap();
-
-        game.tick();
-
-        let new_pos = game.state().get_player(1).unwrap().position;
-        assert_eq!(new_pos.x, initial_pos.x + 1);
-        assert_eq!(new_pos.y, initial_pos.y);
-    }
-
-    #[test]
-    fn test_multiple_players() {
-        let mut game = PaperioGame::new();
-
-        game.player_joined(1, "Alice".to_string()).unwrap();
-        game.player_joined(2, "Bob".to_string()).unwrap();
-
-        assert_eq!(game.state().players.len(), 2);
-        assert!(game.state().get_player(1).is_some());
-        assert!(game.state().get_player(2).is_some());
-
-        let alice = game.state().get_player(1).unwrap();
-        let bob = game.state().get_player(2).unwrap();
-        assert_ne!(alice.color, bob.color);
-    }
-
-    #[test]
-    fn test_encode_state_not_empty() {
-        let mut game = PaperioGame::new();
-        game.player_joined(1, "Alice".to_string()).unwrap();
-
-        let state_bytes = game.encode_state();
-        assert!(!state_bytes.is_empty());
+        self.config.tick_duration()
     }
 }

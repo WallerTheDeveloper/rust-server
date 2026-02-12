@@ -9,6 +9,12 @@ enum Direction {
   DIRECTION_RIGHT = 4;
 }
 
+
+enum StateType {
+  STATE_FULL = 0;  
+  STATE_DELTA = 1;
+}
+
 message PaperioInput {
   Direction direction = 1;
 }
@@ -44,12 +50,21 @@ message TerritoryRun {
   uint32 count = 2;
 }
 
+message TerritoryCell {
+  int32 x = 1;
+  int32 y = 2;
+  uint32 owner_id = 3;
+}
+
 message PaperioState {
   uint32 tick = 1;
   repeated PaperioPlayer players = 2;
   repeated TerritoryRow territory = 3;
   uint32 grid_width = 4;
   uint32 grid_height = 5;
+  StateType state_type = 6;
+  repeated TerritoryCell territory_changes = 7;
+  uint32 keyframe_tick = 8;
 }
 
 message PaperioDelta {
