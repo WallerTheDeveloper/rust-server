@@ -284,7 +284,7 @@ mod tests {
     fn test_grid_pos_operations() {
         let pos = GridPos::new(5, 10);
         assert_eq!(pos.offset(1, -1), GridPos::new(6, 9));
-        assert_eq!(pos.moved(Direction::Up), GridPos::new(5, 9));
+        assert_eq!(pos.moved(Direction::Up), GridPos::new(5, 11));
         assert_eq!(pos.moved(Direction::Right), GridPos::new(6, 10));
     }
 
@@ -297,8 +297,8 @@ mod tests {
 
     #[test]
     fn test_direction_delta() {
-        assert_eq!(Direction::Up.delta(), (0, -1));
-        assert_eq!(Direction::Down.delta(), (0, 1));
+        assert_eq!(Direction::Up.delta(), (0, 1));
+        assert_eq!(Direction::Down.delta(), (0, -1));
         assert_eq!(Direction::Left.delta(), (-1, 0));
         assert_eq!(Direction::Right.delta(), (1, 0));
         assert_eq!(Direction::None.delta(), (0, 0));

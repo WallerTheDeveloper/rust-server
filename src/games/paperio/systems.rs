@@ -801,7 +801,7 @@ mod tests {
 
         state.players.get_mut(&1).unwrap().position = GridPos::new(10, 0);
 
-        set_player_direction(&mut state, 1, Direction::Up).unwrap();
+        set_player_direction(&mut state, 1, Direction::Down).unwrap();
 
         let results = update_movement(&mut state, &config);
 
