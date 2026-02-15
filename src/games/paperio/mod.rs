@@ -67,7 +67,7 @@ impl PaperioGame {
             self.last_keyframe_snapshot = Some(TerritorySnapshot::capture(&self.state.territory));
             self.last_keyframe_tick = self.tick;
 
-            tracing::debug!(
+            tracing::trace!(
                 "Tick {}: sending KEYFRAME (full state)",
                 self.tick
             );
@@ -77,7 +77,7 @@ impl PaperioGame {
             let snapshot = self.last_keyframe_snapshot.as_ref().unwrap();
             let territory_changes = snapshot.diff(&self.state.territory);
 
-            tracing::debug!(
+            tracing::trace!(
                 "Tick {}: sending DELTA ({} territory changes, keyframe={})",
                 self.tick,
                 territory_changes.len(),

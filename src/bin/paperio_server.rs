@@ -130,7 +130,7 @@ async fn main() -> std::io::Result<()> {
         let (data, addr) = match server.recv().await {
             Ok(result) => result,
             Err(e) => {
-                tracing::debug!("Connection lost with client: {}", e);
+                tracing::trace!("Connection lost with client: {}", e);
                 continue;
             }
         };
