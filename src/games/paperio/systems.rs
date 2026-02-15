@@ -35,6 +35,21 @@ pub fn update_movement(state: &mut GameState, config: &PaperioConfig) -> Vec<(Pl
 fn move_player(state: &mut GameState, player_id: PlayerId, config: &PaperioConfig) -> MoveResult {
     let mut result = MoveResult::default();
 
+    {
+        let player = match state.players.get_mut(&player_id) {
+            Some(p) if p.alive => p,
+            _ => return result,
+        };
+
+        if player.move_timer > 0 {
+            player.move_timer -= 1;
+            return result;
+        }
+
+        // Reset timer for next move
+        player.move_timer = config.move_interval_ticks.saturating_sub(1);
+    }
+
     let (current_pos, direction, was_in_territory) = {
         let player = match state.players.get(&player_id) {
             Some(p) if p.alive => p,
@@ -103,6 +118,7 @@ pub fn set_player_direction(
         return Err("Cannot reverse direction");
     }
 
+    player.move_timer = 0;
     player.direction = new_direction;
     Ok(())
 }
@@ -563,6 +579,8 @@ pub fn respawn_player(
         player.direction = Direction::None;
         player.trail.clear();
         player.invulnerability_timer = config.invulnerability_ticks;
+
+        player.move_timer = 0;
 
         tracing::info!(
             "Player {} respawned at {:?} with {} ticks invulnerability",

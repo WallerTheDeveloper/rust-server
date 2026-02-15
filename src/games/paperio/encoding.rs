@@ -206,6 +206,7 @@ pub fn encode_join_response(
         your_player_id: player_id,
         initial_state: Some(initial_state),
         tick_rate_ms: 1000 / config.tick_rate_hz,
+        move_interval_ticks: 3
     };
 
     response.encode_to_vec()

@@ -208,6 +208,7 @@ pub struct Player {
     pub respawn_timer: u32,
     /// Ticks remaining of invulnerability (0 if vulnerable)
     pub invulnerability_timer: u32,
+    pub move_timer: u32,
 }
 
 impl Player {
@@ -223,6 +224,7 @@ impl Player {
             color,
             respawn_timer: 0,
             invulnerability_timer: 0,
+            move_timer: 0,
         }
     }
 

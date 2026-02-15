@@ -96,4 +96,5 @@ message PaperioJoinResponse {
   uint32 your_player_id = 1;
   PaperioState initial_state = 2;
   uint32 tick_rate_ms = 3;
+  uint32 move_interval_ticks = 4;
 }

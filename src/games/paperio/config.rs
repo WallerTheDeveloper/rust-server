@@ -22,6 +22,7 @@ pub struct PaperioConfig {
     /// At 20Hz tick rate, 20 = one keyframe per second.
     /// Between keyframes, only changed cells are sent.
     pub keyframe_interval: u32,
+    pub move_interval_ticks: u32,
 }
 
 impl PaperioConfig {
@@ -54,6 +55,7 @@ impl Default for PaperioConfig {
             invulnerability_ticks: 40,
             min_spawn_distance: 15,
             keyframe_interval: 20,
+            move_interval_ticks: 3,
         }
     }
 }
