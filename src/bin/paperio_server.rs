@@ -420,10 +420,7 @@ async fn handle_leave_room(server: &UdpServer, state: &mut ServerState, addr: So
     if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
         game_room.remove_player(player_id);
     }
-
-    if let Some(session) = state.sessions.get_by_addr_mut(&addr) {
-        session.room_code = None;
-    }
+    state.sessions.mark_disconnected(&addr);
 
     let remaining_ids = state.rooms.get_room_player_ids(&room_code);
 
