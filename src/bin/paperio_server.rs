@@ -48,6 +48,23 @@ impl GameRoom {
         self.game.player_left(player_id);
     }
 
+    fn reconnect_player(
+        &mut self,
+        player_id: PlayerId,
+        addr: SocketAddr,
+        name: String,
+    ) -> Result<Vec<u8>, String> {
+        self.game.player_left(player_id);
+        self.player_addrs.insert(player_id, addr);
+        self.game
+            .player_joined(player_id, name)
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn has_player(&self, player_id: PlayerId) -> bool {
+        self.player_addrs.contains_key(&player_id)
+    }
+
     fn queue_input(&mut self, player_id: PlayerId, payload: Vec<u8>) {
         self.input_queue.push(QueuedInput { player_id, payload });
     }
@@ -247,7 +264,6 @@ async fn run_cleanup_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>
         let grace_period = state.sessions.grace_period_seconds();
 
         for player_id in disconnected {
-
             let notify_task = (|| {
                 let session = state.sessions.get_by_player_id(player_id)?;
                 let room_code = session.room_code.as_ref()?;
@@ -262,29 +278,45 @@ async fn run_cleanup_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>
                         let msg = ServerMessage {
                             sequence: state.sessions.next_send_sequence(&addr),
                             payload: Some(server_message::Payload::PlayerDisconnected(
-                                PlayerDisconnected { player_id, grace_period_seconds: grace_period },
+                                PlayerDisconnected {
+                                    player_id,
+                                    grace_period_seconds: grace_period,
+                                },
                             )),
                         };
                         let _ = server.send(&msg.encode_to_vec(), addr).await;
                     }
                 }
-                tracing::info!("Player {} disconnected from room {}", player_id, room_code);
+
+                if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
+                    game_room.player_addrs.remove(&player_id);
+                }
+
+                tracing::info!(
+                    "Player {} disconnected from room {} (grace period: {}s)",
+                    player_id,
+                    room_code,
+                    grace_period
+                );
             }
         }
 
+        // Handle fully expired sessions (grace period done — permanent removal)
         let expired = state.sessions.cleanup_expired_disconnected();
         for session in expired {
             let room_code = match &session.room_code {
-                Some(code) => code,
+                Some(code) => code.clone(),
                 None => continue,
             };
 
-            state.rooms.leave_room(session.player_id);
-            if let Some(game_room) = state.game_rooms.get_mut(room_code) {
+            // NOW we fully clean up: remove from game state and room
+            if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
                 game_room.remove_player(session.player_id);
             }
+            state.rooms.leave_room(session.player_id);
 
-            for other_id in state.rooms.get_room_player_ids(room_code) {
+            // Notify remaining players
+            for other_id in state.rooms.get_room_player_ids(&room_code) {
                 if let Some(other) = state.sessions.get_by_player_id(other_id) {
                     let addr = other.addr;
                     let msg = ServerMessage {
@@ -297,7 +329,22 @@ async fn run_cleanup_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>
                 }
             }
 
-            tracing::info!("Player {} left the room {}", session.player_id, room_code);
+            // Clean up empty game rooms only after permanent removal
+            if let Some(game_room) = state.game_rooms.get(&room_code) {
+                if game_room.player_count() == 0 {
+                    // Check if any session still references this room
+                    let any_session_in_room = state.sessions.has_players_in_room(&room_code);
+                    if !any_session_in_room {
+                        state.game_rooms.remove(&room_code);
+                        tracing::info!("Game room {} removed (no players left)", room_code);
+                    }
+                }
+            }
+
+            tracing::info!(
+                "Player {} permanently removed (grace period expired)",
+                session.player_id
+            );
         }
     }
 }
@@ -412,29 +459,71 @@ async fn handle_leave_room(server: &UdpServer, state: &mut ServerState, addr: So
         None => return,
     };
 
-    let room_code = match state.rooms.leave_room(player_id) {
+    let room_code = match state.sessions.get_by_addr(&addr).and_then(|s| s.room_code.clone()) {
         Some(code) => code,
         None => return,
     };
 
-    if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
-        game_room.remove_player(player_id);
-    }
-    state.sessions.mark_disconnected(&addr);
+    let is_game_playing = state
+        .rooms
+        .get_room(&room_code)
+        .map(|r| r.state == RoomState::Playing)
+        .unwrap_or(false);
 
-    let remaining_ids = state.rooms.get_room_player_ids(&room_code);
-
-    for pid in remaining_ids {
-        if let Some(other_addr) = state.sessions.get_by_player_id(pid).map(|s| s.addr) {
-            let msg = ServerMessage {
-                sequence: state.sessions.next_send_sequence(&other_addr),
-                payload: Some(server_message::Payload::PlayerLeft(PlayerLeft { player_id })),
-            };
-            let _ = server.send(&msg.encode_to_vec(), other_addr).await;
+    if is_game_playing {
+        // Game is active — DON'T destroy the room.
+        // Just remove from address map (stop sending ticks) and mark disconnected.
+        // The player can reconnect during grace period.
+        if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
+            game_room.player_addrs.remove(&player_id);
         }
-    }
+        state.sessions.mark_disconnected(&addr);
 
-    tracing::info!("Player {} left room {}", player_id, room_code);
+        // Notify others that player disconnected (not permanently left)
+        let grace_period = state.sessions.grace_period_seconds();
+        let player_ids = state.rooms.get_room_player_ids(&room_code);
+        for pid in player_ids.into_iter().filter(|&id| id != player_id) {
+            if let Some(other_addr) = state.sessions.get_by_player_id(pid).map(|s| s.addr) {
+                let msg = ServerMessage {
+                    sequence: state.sessions.next_send_sequence(&other_addr),
+                    payload: Some(server_message::Payload::PlayerDisconnected(
+                        PlayerDisconnected {
+                            player_id,
+                            grace_period_seconds: grace_period,
+                        },
+                    )),
+                };
+                let _ = server.send(&msg.encode_to_vec(), other_addr).await;
+            }
+        }
+
+        tracing::info!(
+            "Player {} left during active game in room {} — treating as disconnect (grace: {}s)",
+            player_id,
+            room_code,
+            grace_period
+        );
+    } else {
+        // Game is NOT active (Waiting/Ended) — original behavior: full removal
+        state.rooms.leave_room(player_id);
+        if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
+            game_room.remove_player(player_id);
+        }
+        state.sessions.mark_disconnected(&addr);
+
+        let remaining_ids = state.rooms.get_room_player_ids(&room_code);
+        for pid in remaining_ids {
+            if let Some(other_addr) = state.sessions.get_by_player_id(pid).map(|s| s.addr) {
+                let msg = ServerMessage {
+                    sequence: state.sessions.next_send_sequence(&other_addr),
+                    payload: Some(server_message::Payload::PlayerLeft(PlayerLeft { player_id })),
+                };
+                let _ = server.send(&msg.encode_to_vec(), other_addr).await;
+            }
+        }
+
+        tracing::info!("Player {} left room {} (lobby state)", player_id, room_code);
+    }
 }
 
 async fn handle_ready(server: &UdpServer, state: &mut ServerState, addr: SocketAddr) {
@@ -486,7 +575,11 @@ async fn handle_ready(server: &UdpServer, state: &mut ServerState, addr: SocketA
         }
     }
 
-    if should_start {
+    let is_already_playing = state.rooms.get_room(&room_code)
+            .map(|r| r.state == RoomState::Playing)
+            .unwrap_or(false);
+
+    if should_start && !is_already_playing {
         if let Some(room) = state.rooms.get_player_room_mut(player_id) {
             room.state = RoomState::Playing;
         }
@@ -565,7 +658,8 @@ async fn handle_reconnect(
     addr: SocketAddr,
     reconnect: rust_server::protocol::client::Reconnect,
 ) {
-    let session_data = state.sessions
+    let session_data = state
+        .sessions
         .reconnected_by_token(&reconnect.token, addr, reconnect.player_name.clone())
         .map(|s| (s.player_id, s.reconnect_token.clone(), s.room_code.clone()));
 
@@ -576,7 +670,8 @@ async fn handle_reconnect(
             let response = ServerMessage {
                 sequence: seq,
                 payload: Some(server_message::Payload::Error(Error {
-                    message: "Reconnection failed: invalid token or grace period expired".to_string(),
+                    message: "Reconnection failed: invalid token or grace period expired"
+                        .to_string(),
                 })),
             };
             let _ = server.send(&response.encode_to_vec(), addr).await;
@@ -601,19 +696,60 @@ async fn handle_reconnect(
         return;
     };
 
-    if let Some(game_room) = state.game_rooms.get_mut(&code) {
-        game_room.player_addrs.insert(player_id, addr);
-    }
+    let reconnect_game_data = {
+        let is_playing = state
+            .rooms
+            .get_room(&code)
+            .map(|r| r.state == RoomState::Playing)
+            .unwrap_or(false);
+
+        if is_playing {
+            let player_name = state
+                .rooms
+                .get_room(&code)
+                .and_then(|r| r.players.get(&player_id))
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| reconnect.player_name.clone());
+
+            if let Some(game_room) = state.game_rooms.get_mut(&code) {
+                match game_room.reconnect_player(player_id, addr, player_name) {
+                    Ok(join_response) => Some(join_response),
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to reconnect player {} to game: {}",
+                            player_id,
+                            e
+                        );
+                        game_room.player_addrs.insert(player_id, addr);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            if let Some(game_room) = state.game_rooms.get_mut(&code) {
+                game_room.player_addrs.insert(player_id, addr);
+            }
+            None
+        }
+    };
 
     let room_info = state.rooms.get_room(&code).map(|room| {
-        let players = room.players.values()
+        let players = room
+            .players
+            .values()
             .map(|p| PlayerInfo {
                 player_id: p.player_id,
                 name: p.name.clone(),
                 ready: p.ready,
-            }).collect::<Vec<_>>();
-        let other_ids = room.get_player_ids().into_iter()
-            .filter(|&pid| pid != player_id).collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
+        let other_ids = room
+            .get_player_ids()
+            .into_iter()
+            .filter(|&pid| pid != player_id)
+            .collect::<Vec<_>>();
         (players, other_ids)
     });
 
@@ -621,12 +757,18 @@ async fn handle_reconnect(
         Some(info) => info,
         None => {
             let seq = state.sessions.next_send_sequence(&addr);
-            let _ = server.send(&ServerMessage {
-                sequence: seq,
-                payload: Some(server_message::Payload::Error(Error {
-                    message: "Room no longer exists".to_string(),
-                })),
-            }.encode_to_vec(), addr).await;
+            let _ = server
+                .send(
+                    &ServerMessage {
+                        sequence: seq,
+                        payload: Some(server_message::Payload::Error(Error {
+                            message: "Room no longer exists".to_string(),
+                        })),
+                    }
+                        .encode_to_vec(),
+                    addr,
+                )
+                .await;
             return;
         }
     };
@@ -642,7 +784,7 @@ async fn handle_reconnect(
     };
     let _ = server.send(&response.encode_to_vec(), addr).await;
 
-    // Notify others
+    // Notify other players
     for pid in other_ids {
         if let Some(other_addr) = state.sessions.get_by_player_id(pid).map(|s| s.addr) {
             let msg = ServerMessage {
@@ -655,7 +797,33 @@ async fn handle_reconnect(
         }
     }
 
-    tracing::info!("Player {} reconnected to room {}", player_id, code);
+    // If game is running, send GameStarting + JoinResponse
+    if let Some(join_response) = reconnect_game_data {
+        let starting = ServerMessage {
+            sequence: state.sessions.next_send_sequence(&addr),
+            payload: Some(server_message::Payload::GameStarting(GameStarting {
+                countdown_seconds: 0,
+            })),
+        };
+        let _ = server.send(&starting.encode_to_vec(), addr).await;
+
+        let game_msg = ServerMessage {
+            sequence: state.sessions.next_send_sequence(&addr),
+            payload: Some(server_message::Payload::GameMessage(ServerGameMessage {
+                from_player_id: 0,
+                payload: join_response,
+            })),
+        };
+        let _ = server.send(&game_msg.encode_to_vec(), addr).await;
+
+        tracing::info!(
+            "Player {} reconnected and re-entered active game in room {}",
+            player_id,
+            code
+        );
+    } else {
+        tracing::info!("Player {} reconnected to room {}", player_id, code);
+    }
 }
 
 fn current_timestamp_ms() -> u64 {

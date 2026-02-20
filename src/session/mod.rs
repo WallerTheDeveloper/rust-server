@@ -173,6 +173,12 @@ impl SessionManager {
             .and_then(|addr| self.sessions_by_addr.get(addr))
     }
 
+    pub fn has_players_in_room(&self, room_code: &str) -> bool {
+        self.sessions_by_addr.values().any(|session| {
+            session.room_code.as_deref() == Some(room_code)
+        })
+    }
+
     pub fn remove(&mut self, addr: &SocketAddr) -> Option<Session> {
         if let Some(session) = self.sessions_by_addr.remove(addr) {
             self.addr_by_player_id.remove(&session.player_id);
@@ -265,6 +271,9 @@ impl SessionManager {
         session.disconnected_at = None;
         session.last_seen = Instant::now();
 
+        session.last_recv_sequence = 0;
+        session.send_sequence = 0;
+        
         self.addr_by_player_id.insert(player_id, new_addr);
         self.sessions_by_addr.insert(new_addr, session);
 
