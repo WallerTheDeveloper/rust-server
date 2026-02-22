@@ -25,6 +25,7 @@ pub struct PaperioGame {
     last_keyframe_snapshot: Option<TerritorySnapshot>,
     /// Tick number of the last keyframe sent.
     last_keyframe_tick: u32,
+    force_keyframe: bool,
 }
 
 impl PaperioGame {
@@ -39,6 +40,7 @@ impl PaperioGame {
             tick: 0,
             last_keyframe_snapshot: None,
             last_keyframe_tick: 0,
+            force_keyframe: false,
         }
     }
 
@@ -59,10 +61,19 @@ impl PaperioGame {
     }
 
     fn is_keyframe_tick(&self) -> bool {
-        self.tick == 1 || self.tick % self.config.keyframe_interval == 0
+        self.force_keyframe || self.tick == 1 || self.tick % self.config.keyframe_interval == 0
     }
 
+    pub fn force_keyframe(&mut self) {
+        self.force_keyframe = true;
+    }
+
+    pub fn force_next_keyframe(&mut self) {
+        self.last_keyframe_snapshot = None;
+    }
+    
     fn encode_tick_state(&mut self) -> Vec<u8> {
+        self.force_keyframe = false;
         if self.is_keyframe_tick() || self.last_keyframe_snapshot.is_none() {
             self.last_keyframe_snapshot = Some(TerritorySnapshot::capture(&self.state.territory));
             self.last_keyframe_tick = self.tick;

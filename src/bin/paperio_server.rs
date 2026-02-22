@@ -45,7 +45,9 @@ impl GameRoom {
 
     fn remove_player(&mut self, player_id: PlayerId) {
         self.player_addrs.remove(&player_id);
-        self.game.player_left(player_id);
+        if self.game.state().players.contains_key(&player_id) {
+            self.game.player_left(player_id);
+        }
     }
 
     fn reconnect_player(
@@ -56,9 +58,11 @@ impl GameRoom {
     ) -> Result<Vec<u8>, String> {
         self.game.player_left(player_id);
         self.player_addrs.insert(player_id, addr);
-        self.game
+        let result = self.game
             .player_joined(player_id, name)
-            .map_err(|e| format!("{:?}", e))
+            .map_err(|e| format!("{:?}", e));
+        self.game.force_keyframe();
+        result
     }
 
     fn has_player(&self, player_id: PlayerId) -> bool {
@@ -190,7 +194,7 @@ async fn main() -> std::io::Result<()> {
                 handle_ready(&server, &mut state, addr).await;
             }
             Some(Payload::GameMessage(game_msg)) => {
-                tracing::debug!("-----Received GameMessage: {:#?}-----", game_msg);
+                tracing::debug!("-----Received GameMessage-----");
                 handle_game_message(&mut state, addr, game_msg.payload);
             }
             Some(Payload::Ping(ping)) => {
@@ -311,6 +315,7 @@ async fn run_cleanup_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>
 
             // NOW we fully clean up: remove from game state and room
             if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
+                game_room.game.player_left(session.player_id);
                 game_room.remove_player(session.player_id);
             }
             state.rooms.leave_room(session.player_id);
@@ -454,6 +459,7 @@ async fn handle_join_room(
     }
 }
 async fn handle_leave_room(server: &UdpServer, state: &mut ServerState, addr: SocketAddr) {
+
     let player_id = match state.sessions.get_by_addr(&addr) {
         Some(s) => s.player_id,
         None => return,
@@ -476,6 +482,8 @@ async fn handle_leave_room(server: &UdpServer, state: &mut ServerState, addr: So
         // The player can reconnect during grace period.
         if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
             game_room.player_addrs.remove(&player_id);
+            game_room.game.player_left(player_id);
+            game_room.game.force_next_keyframe();
         }
         state.sessions.mark_disconnected(&addr);
 
