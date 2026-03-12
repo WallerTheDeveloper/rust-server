@@ -3,6 +3,8 @@ use rust_server::config::SERVER_ADDR;
 use rust_server::game::traits::{Game, PlayerId};
 use rust_server::games::paperio::{PaperioConfig, PaperioGame};
 use rust_server::network::udp::UdpServer;
+use rust_server::network::transport::Transport;
+use rust_server::network::ws::{start_ws_listener, WsEvent};
 use rust_server::protocol::client::{client_message::Payload, ClientMessage, Ping};
 use rust_server::protocol::server::{
     server_message, Error, GameMessage as ServerGameMessage, GameStarting, PlayerDisconnected,
@@ -16,6 +18,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+const WS_ADDR: &str = "0.0.0.0:9001";
 
 struct QueuedInput {
     player_id: PlayerId,
@@ -130,25 +134,64 @@ async fn main() -> std::io::Result<()> {
 
     tracing::info!("Starting Paper.io Authoritative Server");
 
-    let server = Arc::new(UdpServer::bind(SERVER_ADDR).await?);
-    tracing::info!("Server bound to {}", SERVER_ADDR);
+    // UDP (existing)
+    let udp_server = Arc::new(UdpServer::bind(SERVER_ADDR).await?);
+    tracing::info!("UDP server bound to {}", SERVER_ADDR);
+
+    // WebSocket (new)
+    let (mut ws_events, ws_manager) = start_ws_listener(WS_ADDR).await?;
+    tracing::info!("WebSocket server bound to {}", WS_ADDR);
+
+    // Unified transport — routes to UDP or WS automatically
+    let transport = Arc::new(Transport::new(udp_server.clone(), ws_manager.clone()));
 
     let state = Arc::new(Mutex::new(ServerState::new()));
 
-    let tick_server = server.clone();
+    // Tick loop
+    let tick_transport = transport.clone();
     let tick_state = state.clone();
     tokio::spawn(async move {
-        run_tick_loop(tick_server, tick_state).await;
+        run_tick_loop(tick_transport, tick_state).await;
     });
 
+    // Cleanup loop
+    let cleanup_transport = transport.clone();
     let cleanup_state = state.clone();
-    let cleanup_server = server.clone();
     tokio::spawn(async move {
-        run_cleanup_loop(cleanup_server, cleanup_state).await;
+        run_cleanup_loop(cleanup_transport, cleanup_state).await;
     });
 
+    // WebSocket event loop — runs alongside the UDP receive loop
+    let ws_transport = transport.clone();
+    let ws_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(event) = ws_events.recv().await {
+            match event {
+                WsEvent::Connected { virtual_addr, .. } => {
+                    tracing::info!("WS client connected: {}", virtual_addr);
+                }
+                WsEvent::Data { virtual_addr, payload } => {
+                    let msg = match ClientMessage::decode(&payload[..]) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            tracing::warn!("Failed to decode WS message from {}: {}", virtual_addr, e);
+                            continue;
+                        }
+                    };
+
+                    let mut state = ws_state.lock().await;
+                    process_client_message(&ws_transport, &mut state, virtual_addr, msg).await;
+                }
+                WsEvent::Disconnected { virtual_addr } => {
+                    tracing::info!("WS client disconnected: {}", virtual_addr);
+                }
+            }
+        }
+    });
+
+    // Main UDP receive loop
     loop {
-        let (data, addr) = match server.recv().await {
+        let (data, addr) = match udp_server.recv().await {
             Ok(result) => result,
             Err(e) => {
                 tracing::trace!("Connection lost with client: {}", e);
@@ -165,53 +208,77 @@ async fn main() -> std::io::Result<()> {
         };
 
         let mut state = state.lock().await;
+        process_client_message(&transport, &mut state, addr, msg).await;
+    }
+}
 
-        match state.sessions.check_sequence(&addr, msg.sequence) {
-            SequenceCheck::Valid => {}
-            SequenceCheck::Gap(gap) => {
-                tracing::debug!("Packet gap of {} from {}", gap, addr);
-            }
-            SequenceCheck::Duplicate => {
-                tracing::trace!("Duplicate packet from {}", addr);
-                continue;
-            }
-            SequenceCheck::Invalid => {
-                tracing::warn!("Invalid sequence from {}", addr);
+// ── Unified message router ──────────────────────────────────────────────
+// Both the UDP loop and WS event loop call this same function.
+// JoinRoom and Reconnect bypass the sequence check because they
+// CREATE the session — there's nothing to check against yet.
+
+async fn process_client_message(
+    transport: &Transport,
+    state: &mut ServerState,
+    addr: SocketAddr,
+    msg: ClientMessage,
+) {
+    // Session-establishing messages bypass sequence check
+    match &msg.payload {
+        Some(Payload::JoinRoom(_)) | Some(Payload::Reconnect(_)) => {
+            tracing::debug!("Session-establishing message from {}, skipping sequence check", addr);
+        }
+        _ => {
+            match state.sessions.check_sequence(&addr, msg.sequence) {
+                SequenceCheck::Valid => {}
+                SequenceCheck::Gap(gap) => {
+                    tracing::debug!("Packet gap of {} from {}", gap, addr);
+                }
+                SequenceCheck::Duplicate => {
+                    tracing::trace!("Duplicate packet from {}", addr);
+                    return;
+                }
+                SequenceCheck::Invalid => {
+                    tracing::warn!("Invalid sequence from {} (no session)", addr);
+                    return;
+                }
             }
         }
+    }
 
-        match msg.payload {
-            Some(Payload::JoinRoom(join)) => {
-                tracing::debug!("-----Received JoinRoom: {:#?}-----", join);
-                handle_join_room(&server, &mut state, addr, join).await;
-            }
-            Some(Payload::LeaveRoom(_)) => {
-                tracing::debug!("-----Received LeaveRoom-----");
-                handle_leave_room(&server, &mut state, addr).await;
-            }
-            Some(Payload::Ready(_)) => {
-                tracing::debug!("-----Received Ready-----");
-                handle_ready(&server, &mut state, addr).await;
-            }
-            Some(Payload::GameMessage(game_msg)) => {
-                tracing::debug!("-----Received GameMessage-----");
-                handle_game_message(&mut state, addr, game_msg.payload);
-            }
-            Some(Payload::Ping(ping)) => {
-                handle_ping(&server, &mut state, addr, ping).await;
-            }
-            Some(Payload::Reconnect(reconnect)) => {
-                tracing::debug!("-----Received Reconnect: {:#?}-----", reconnect);
-                handle_reconnect(&server, &mut state, addr, reconnect).await;
-            }
-            None => {
-                tracing::warn!("Empty message from {}", addr);
-            }
+    match msg.payload {
+        Some(Payload::JoinRoom(join)) => {
+            tracing::debug!("-----Received JoinRoom: {:#?}-----", join);
+            handle_join_room(transport, state, addr, join).await;
+        }
+        Some(Payload::LeaveRoom(_)) => {
+            tracing::debug!("-----Received LeaveRoom-----");
+            handle_leave_room(transport, state, addr).await;
+        }
+        Some(Payload::Ready(_)) => {
+            tracing::debug!("-----Received Ready-----");
+            handle_ready(transport, state, addr).await;
+        }
+        Some(Payload::GameMessage(game_msg)) => {
+            tracing::debug!("-----Received GameMessage-----");
+            handle_game_message(state, addr, game_msg.payload);
+        }
+        Some(Payload::Ping(ping)) => {
+            handle_ping(transport, state, addr, ping).await;
+        }
+        Some(Payload::Reconnect(reconnect)) => {
+            tracing::debug!("-----Received Reconnect: {:#?}-----", reconnect);
+            handle_reconnect(transport, state, addr, reconnect).await;
+        }
+        None => {
+            tracing::warn!("Empty message from {}", addr);
         }
     }
 }
 
-async fn run_tick_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>) {
+// ── Tick loop ────────────────────────────────────────────────────────────
+
+async fn run_tick_loop(transport: Arc<Transport>, state: Arc<Mutex<ServerState>>) {
     let tick_duration = Duration::from_millis(50);
     let mut last_tick = Instant::now();
 
@@ -248,7 +315,7 @@ async fn run_tick_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>) {
                         })),
                     };
 
-                    if let Err(e) = server.send(&msg.encode_to_vec(), addr).await {
+                    if let Err(e) = transport.send(&msg.encode_to_vec(), addr).await {
                         tracing::warn!("Failed to send state to player {}: {}", player_id, e);
                     }
                 }
@@ -257,7 +324,9 @@ async fn run_tick_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>) {
     }
 }
 
-async fn run_cleanup_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>) {
+// ── Cleanup loop ─────────────────────────────────────────────────────────
+
+async fn run_cleanup_loop(transport: Arc<Transport>, state: Arc<Mutex<ServerState>>) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
 
     loop {
@@ -288,7 +357,7 @@ async fn run_cleanup_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>
                                 },
                             )),
                         };
-                        let _ = server.send(&msg.encode_to_vec(), addr).await;
+                        let _ = transport.send(&msg.encode_to_vec(), addr).await;
                     }
                 }
 
@@ -313,14 +382,12 @@ async fn run_cleanup_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>
                 None => continue,
             };
 
-            // NOW we fully clean up: remove from game state and room
             if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
                 game_room.game.player_left(session.player_id);
                 game_room.remove_player(session.player_id);
             }
             state.rooms.leave_room(session.player_id);
 
-            // Notify remaining players
             for other_id in state.rooms.get_room_player_ids(&room_code) {
                 if let Some(other) = state.sessions.get_by_player_id(other_id) {
                     let addr = other.addr;
@@ -330,14 +397,12 @@ async fn run_cleanup_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>
                             player_id: session.player_id,
                         })),
                     };
-                    let _ = server.send(&msg.encode_to_vec(), addr).await;
+                    let _ = transport.send(&msg.encode_to_vec(), addr).await;
                 }
             }
 
-            // Clean up empty game rooms only after permanent removal
             if let Some(game_room) = state.game_rooms.get(&room_code) {
                 if game_room.player_count() == 0 {
-                    // Check if any session still references this room
                     let any_session_in_room = state.sessions.has_players_in_room(&room_code);
                     if !any_session_in_room {
                         state.game_rooms.remove(&room_code);
@@ -354,8 +419,11 @@ async fn run_cleanup_loop(server: Arc<UdpServer>, state: Arc<Mutex<ServerState>>
     }
 }
 
+// ── Handler functions ────────────────────────────────────────────────────
+// All take &Transport instead of &UdpServer so they work for both UDP and WS.
+
 async fn handle_join_room(
-    server: &UdpServer,
+    transport: &Transport,
     state: &mut ServerState,
     addr: SocketAddr,
     join: rust_server::protocol::client::JoinRoom,
@@ -396,7 +464,7 @@ async fn handle_join_room(
                     reconnect_token,
                 })),
             };
-            let _ = server.send(&join_msg.encode_to_vec(), addr).await;
+            let _ = transport.send(&join_msg.encode_to_vec(), addr).await;
 
             for pid in other_pids {
                 if let Some(other_addr) = state.sessions.get_by_player_id(pid).map(|s| s.addr) {
@@ -406,26 +474,26 @@ async fn handle_join_room(
                             players: players.clone(),
                         })),
                     };
-                    let _ = server.send(&update_msg.encode_to_vec(), other_addr).await;
+                    let _ = transport.send(&update_msg.encode_to_vec(), other_addr).await;
                 }
             }
 
             tracing::info!("Player {} joined room '{}'", player_id, room_code);
+
+            // Check if joining a game already in progress
             if let Some(room) = state.rooms.get_room(&room_code) {
                 if room.state == RoomState::Playing {
                     if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
                         match game_room.add_player(player_id, addr, join.player_name.clone()) {
                             Ok(join_response) => {
-                                // Send GameStarting with no countdown
                                 let starting = ServerMessage {
                                     sequence: state.sessions.next_send_sequence(&addr),
                                     payload: Some(server_message::Payload::GameStarting(GameStarting {
                                         countdown_seconds: 0,
                                     })),
                                 };
-                                let _ = server.send(&starting.encode_to_vec(), addr).await;
+                                let _ = transport.send(&starting.encode_to_vec(), addr).await;
 
-                                // Send initial game state
                                 let game_msg = ServerMessage {
                                     sequence: state.sessions.next_send_sequence(&addr),
                                     payload: Some(server_message::Payload::GameMessage(
@@ -435,7 +503,7 @@ async fn handle_join_room(
                                         },
                                     )),
                                 };
-                                let _ = server.send(&game_msg.encode_to_vec(), addr).await;
+                                let _ = transport.send(&game_msg.encode_to_vec(), addr).await;
 
                                 tracing::info!("Late joiner {} added to active game in room {}", player_id, room_code);
                             }
@@ -454,12 +522,12 @@ async fn handle_join_room(
                     message: format!("Failed to join room: {:?}", e),
                 })),
             };
-            let _ = server.send(&error_msg.encode_to_vec(), addr).await;
+            let _ = transport.send(&error_msg.encode_to_vec(), addr).await;
         }
     }
 }
-async fn handle_leave_room(server: &UdpServer, state: &mut ServerState, addr: SocketAddr) {
 
+async fn handle_leave_room(transport: &Transport, state: &mut ServerState, addr: SocketAddr) {
     let player_id = match state.sessions.get_by_addr(&addr) {
         Some(s) => s.player_id,
         None => return,
@@ -477,9 +545,6 @@ async fn handle_leave_room(server: &UdpServer, state: &mut ServerState, addr: So
         .unwrap_or(false);
 
     if is_game_playing {
-        // Game is active — DON'T destroy the room.
-        // Just remove from address map (stop sending ticks) and mark disconnected.
-        // The player can reconnect during grace period.
         if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
             game_room.player_addrs.remove(&player_id);
             game_room.game.player_left(player_id);
@@ -487,7 +552,6 @@ async fn handle_leave_room(server: &UdpServer, state: &mut ServerState, addr: So
         }
         state.sessions.mark_disconnected(&addr);
 
-        // Notify others that player disconnected (not permanently left)
         let grace_period = state.sessions.grace_period_seconds();
         let player_ids = state.rooms.get_room_player_ids(&room_code);
         for pid in player_ids.into_iter().filter(|&id| id != player_id) {
@@ -501,40 +565,42 @@ async fn handle_leave_room(server: &UdpServer, state: &mut ServerState, addr: So
                         },
                     )),
                 };
-                let _ = server.send(&msg.encode_to_vec(), other_addr).await;
+                let _ = transport.send(&msg.encode_to_vec(), other_addr).await;
             }
         }
 
         tracing::info!(
-            "Player {} left during active game in room {} — treating as disconnect (grace: {}s)",
+            "Player {} left during active game in room {} (grace period started)",
             player_id,
-            room_code,
-            grace_period
+            room_code
         );
     } else {
-        // Game is NOT active (Waiting/Ended) — original behavior: full removal
+        let player_ids = state.rooms.get_room_player_ids(&room_code);
         state.rooms.leave_room(player_id);
-        if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
-            game_room.remove_player(player_id);
-        }
-        state.sessions.mark_disconnected(&addr);
 
-        let remaining_ids = state.rooms.get_room_player_ids(&room_code);
-        for pid in remaining_ids {
-            if let Some(other_addr) = state.sessions.get_by_player_id(pid).map(|s| s.addr) {
-                let msg = ServerMessage {
-                    sequence: state.sessions.next_send_sequence(&other_addr),
-                    payload: Some(server_message::Payload::PlayerLeft(PlayerLeft { player_id })),
-                };
-                let _ = server.send(&msg.encode_to_vec(), other_addr).await;
+        if let Some(s) = state.sessions.get_by_addr_mut(&addr) {
+            s.room_code = None;
+        }
+
+        let msg = ServerMessage {
+            sequence: state.sessions.next_send_sequence(&addr),
+            payload: Some(server_message::Payload::PlayerLeft(PlayerLeft {
+                player_id,
+            })),
+        };
+        let bytes = msg.encode_to_vec();
+
+        for pid in player_ids.into_iter().filter(|&id| id != player_id) {
+            if let Some(other) = state.sessions.get_by_player_id(pid) {
+                let _ = transport.send(&bytes, other.addr).await;
             }
         }
 
-        tracing::info!("Player {} left room {} (lobby state)", player_id, room_code);
+        tracing::info!("Player {} left room {}", player_id, room_code);
     }
 }
 
-async fn handle_ready(server: &UdpServer, state: &mut ServerState, addr: SocketAddr) {
+async fn handle_ready(transport: &Transport, state: &mut ServerState, addr: SocketAddr) {
     state.sessions.update_last_seen(&addr);
 
     let player_id = match state.sessions.get_by_addr(&addr) {
@@ -551,15 +617,12 @@ async fn handle_ready(server: &UdpServer, state: &mut ServerState, addr: SocketA
                     ready: p.ready,
                 }).collect();
 
-            let player_data: Vec<(u32, String)> = room.players.values()
+            let room_code = room.code.clone();
+            let should_start = room.all_ready() && room.player_count() >= 1;
+            let player_data: Vec<(PlayerId, String)> = room.players.values()
                 .map(|p| (p.player_id, p.name.clone())).collect();
 
-            Some((
-                room.code.clone(),
-                room.all_ready() && room.player_count() >= 1,
-                players_info,
-                player_data
-            ))
+            Some((room_code, should_start, players_info, player_data))
         }
         Err(_) => None,
     };
@@ -579,13 +642,13 @@ async fn handle_ready(server: &UdpServer, state: &mut ServerState, addr: SocketA
                     players: players_info.clone(),
                 })),
             };
-            let _ = server.send(&update.encode_to_vec(), other_addr).await;
+            let _ = transport.send(&update.encode_to_vec(), other_addr).await;
         }
     }
 
     let is_already_playing = state.rooms.get_room(&room_code)
-            .map(|r| r.state == RoomState::Playing)
-            .unwrap_or(false);
+        .map(|r| r.state == RoomState::Playing)
+        .unwrap_or(false);
 
     if should_start && !is_already_playing {
         if let Some(room) = state.rooms.get_player_room_mut(player_id) {
@@ -607,7 +670,7 @@ async fn handle_ready(server: &UdpServer, state: &mut ServerState, addr: SocketA
                                 ServerGameMessage { from_player_id: 0, payload: join_response },
                             )),
                         };
-                        let _ = server.send(&msg.encode_to_vec(), p_addr).await;
+                        let _ = transport.send(&msg.encode_to_vec(), p_addr).await;
                     }
                     Err(e) => tracing::error!("Failed to add player {} to game: {}", pid, e),
                 }
@@ -619,7 +682,7 @@ async fn handle_ready(server: &UdpServer, state: &mut ServerState, addr: SocketA
                         countdown_seconds: 3,
                     })),
                 };
-                let _ = server.send(&starting.encode_to_vec(), p_addr).await;
+                let _ = transport.send(&starting.encode_to_vec(), p_addr).await;
             }
         }
         tracing::info!("Room {} starting game!", room_code);
@@ -638,14 +701,13 @@ fn handle_game_message(state: &mut ServerState, addr: SocketAddr, payload: Vec<u
         return;
     };
 
-    // Queue input for next tick
     if let Some(game_room) = state.game_rooms.get_mut(&room_code) {
         game_room.queue_input(player_id, payload);
         tracing::trace!("Queued input from player {} in room {}", player_id, room_code);
     }
 }
 
-async fn handle_ping(server: &UdpServer, state: &mut ServerState, addr: SocketAddr, ping: Ping) {
+async fn handle_ping(transport: &Transport, state: &mut ServerState, addr: SocketAddr, ping: Ping) {
     state.sessions.ping(&addr);
 
     let pong = ServerMessage {
@@ -657,11 +719,11 @@ async fn handle_ping(server: &UdpServer, state: &mut ServerState, addr: SocketAd
         })),
     };
 
-    let _ = server.send(&pong.encode_to_vec(), addr).await;
+    let _ = transport.send(&pong.encode_to_vec(), addr).await;
 }
 
 async fn handle_reconnect(
-    server: &UdpServer,
+    transport: &Transport,
     state: &mut ServerState,
     addr: SocketAddr,
     reconnect: rust_server::protocol::client::Reconnect,
@@ -682,7 +744,7 @@ async fn handle_reconnect(
                         .to_string(),
                 })),
             };
-            let _ = server.send(&response.encode_to_vec(), addr).await;
+            let _ = transport.send(&response.encode_to_vec(), addr).await;
             tracing::warn!("Failed reconnection attempt from {}", addr);
             return;
         }
@@ -699,7 +761,7 @@ async fn handle_reconnect(
                 reconnect_token,
             })),
         };
-        let _ = server.send(&response.encode_to_vec(), addr).await;
+        let _ = transport.send(&response.encode_to_vec(), addr).await;
         tracing::info!("Player {} reconnected (no room)", player_id);
         return;
     };
@@ -765,7 +827,7 @@ async fn handle_reconnect(
         Some(info) => info,
         None => {
             let seq = state.sessions.next_send_sequence(&addr);
-            let _ = server
+            let _ = transport
                 .send(
                     &ServerMessage {
                         sequence: seq,
@@ -790,9 +852,8 @@ async fn handle_reconnect(
             reconnect_token,
         })),
     };
-    let _ = server.send(&response.encode_to_vec(), addr).await;
+    let _ = transport.send(&response.encode_to_vec(), addr).await;
 
-    // Notify other players
     for pid in other_ids {
         if let Some(other_addr) = state.sessions.get_by_player_id(pid).map(|s| s.addr) {
             let msg = ServerMessage {
@@ -801,11 +862,10 @@ async fn handle_reconnect(
                     player_id,
                 })),
             };
-            let _ = server.send(&msg.encode_to_vec(), other_addr).await;
+            let _ = transport.send(&msg.encode_to_vec(), other_addr).await;
         }
     }
 
-    // If game is running, send GameStarting + JoinResponse
     if let Some(join_response) = reconnect_game_data {
         let starting = ServerMessage {
             sequence: state.sessions.next_send_sequence(&addr),
@@ -813,7 +873,7 @@ async fn handle_reconnect(
                 countdown_seconds: 0,
             })),
         };
-        let _ = server.send(&starting.encode_to_vec(), addr).await;
+        let _ = transport.send(&starting.encode_to_vec(), addr).await;
 
         let game_msg = ServerMessage {
             sequence: state.sessions.next_send_sequence(&addr),
@@ -822,7 +882,7 @@ async fn handle_reconnect(
                 payload: join_response,
             })),
         };
-        let _ = server.send(&game_msg.encode_to_vec(), addr).await;
+        let _ = transport.send(&game_msg.encode_to_vec(), addr).await;
 
         tracing::info!(
             "Player {} reconnected and re-entered active game in room {}",
